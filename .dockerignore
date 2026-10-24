@@ -3,6 +3,7 @@
 !Dockerfile
 !.dockerignore
 !pyproject.toml
+!uv.lock
 !setup.py
 !README.md
 !LICENSE
