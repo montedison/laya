@@ -1,0 +1,42 @@
+# STAGE 1: Builder
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+# Installazione dipendenze di sistema
+RUN apt-get update && apt-get install -y git build-essential && rm -rf /var/lib/apt/lists/*
+
+# Installazione di uv per un setup ultra-veloce
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Copia dei file di progetto e installazione dipendenze CPU-only
+COPY pyproject.toml uv.lock ./
+RUN uv pip install --system --index-url https://download.pytorch.org/whl/cpu \
+    torch==2.4.0 laya[serve,mcp]
+
+# STAGE 2: Runtime
+FROM python:3.11-slim AS runtime
+
+WORKDIR /app
+
+# Copia dell'ambiente virtuale dal builder
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copia del codice sorgente (assumendo che sia nella cartella corrente)
+COPY . /app/
+
+# Configurazione ambiente ottimizzata per CPU
+ENV PATH="/usr/local/bin:$PATH"
+ENV LAYA_DEVICE="cpu"
+ENV LAYA_THREADS="4" 
+ENV HF_HUB_CACHE="/data/huggingface"
+
+# Creazione utente non-root per sicurezza
+RUN useradd -m layauser
+USER layauser
+
+# Volume per la persistenza dei pesi dei modelli
+VOLUME ["/data/huggingface"]
+
+ENTRYPOINT ["laya-serve"]

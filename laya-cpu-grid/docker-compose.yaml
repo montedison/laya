@@ -1,0 +1,31 @@
+services:
+  # Il Motore di Inferenza (Compute-Heavy)
+  laya-core:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    container_name: laya-inference-engine
+    restart: unless-stopped
+    environment:
+      - LAYA_DEVICE=cpu
+      - LAYA_THREADS=4  # Modifica in base ai core reali della tua CPU
+      - LAYA_PRELOAD=1 # Carica i modelli all'avvio per latenza zero dopo il primo uso
+    volumes:
+      - laya_cache:/data/huggingface
+    ports:
+      - "8000:8000"
+
+  # Il Bridge di Comunicazione (IO-Heavy)
+  laya-mcp-bridge:
+    image: laya-inference-engine:latest
+    container_name: laya-mcp-bridge
+    depends_on:
+      - laya-core
+    environment:
+      - LAYA_HOST=laya-core
+      - LAYA_PORT=8000
+    command: ["laya-mcp-server"]
+    restart: unless-stopped
+
+volumes:
+  laya_cache:
