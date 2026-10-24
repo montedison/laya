@@ -6,11 +6,13 @@ WORKDIR /build
 # Installazione dipendenze di sistema
 RUN apt-get update && apt-get install -y git build-essential && rm -rf /var/lib/apt/lists/*
 
-# Installazione di uv per un setup ultra-veloce
+# Installazione di uv per velocità estrema
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-# Copia dei file di progetto e installazione dipendenze CPU-only
+# Copia dei file di progetto dalla ROOT (grazie al context: ..)
 COPY pyproject.toml uv.lock ./
+
+# Installazione dipendenze CPU-only
 RUN uv pip install --system --index-url https://download.pytorch.org/whl/cpu \
     torch==2.4.0 laya[serve,mcp]
 
@@ -23,20 +25,19 @@ WORKDIR /app
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copia del codice sorgente (assumendo che sia nella cartella corrente)
+# Copia di TUTTO il contenuto della ROOT (codice, config, ecc.)
 COPY . /app/
 
 # Configurazione ambiente ottimizzata per CPU
-ENV PATH="/usr/local/bin:$PATH"
+ENV PATH="/app/.venv/bin:$PATH"
 ENV LAYA_DEVICE="cpu"
-ENV LAYA_THREADS="4" 
+ENV LAYA_THREADS="4"
 ENV HF_HUB_CACHE="/data/huggingface"
 
-# Creazione utente non-root per sicurezza
+# Creazione utente non-root
 RUN useradd -m layauser
 USER layauser
 
-# Volume per la persistenza dei pesi dei modelli
 VOLUME ["/data/huggingface"]
 
 ENTRYPOINT ["laya-serve"]
