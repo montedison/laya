@@ -1,13 +1,13 @@
 services:
+  # CORE ENGINE
   laya-core:
     build:
-      context: ..                # Punta alla root del repository (laya/)
+      context: ..
       dockerfile: laya-cpu-grid/Dockerfile.cpu
-    image: laya-inference-engine 
+    image: laya-inference-engine
     container_name: laya-inference-engine
-    restart: unless-stopped
-    # FIX: Usiamo il comando direttamente (si trova in /usr/local/bin/ per via di --system)
-    entrypoint: ["laya-serve"]
+    # CORREZIONE: Rimosso /opt/venv/bin/
+    command: laya-serve
     environment:
       - LAYA_DEVICE=cpu
       - LAYA_THREADS=4
@@ -15,34 +15,35 @@ services:
       - HF_HUB_CACHE=/data/huggingface
     volumes:
       - laya_cache:/data/huggingface
-    networks:
-      - unsloth-net
     ports:
       - "8000:8000"
+    networks:
+      - unsloth-net
+    restart: unless-stopped
 
-  # Il Bridge di Comunicazione (IO-Heavy)
+  # MCP BRIDGE
   laya-mcp-bridge:
-    image: laya-inference-engine 
+    image: laya-inference-engine
     container_name: laya-mcp-bridge
     depends_on:
       - laya-core
-    # FIX: Usiamo il comando direttamente
-    entrypoint: ["laya-mcp-server"]
-    command: ["--host", "0.0.0.0", "--port", "8001"]
     environment:
+      # LAYA_HOST punta al nome del SERVICE (laya-core)
       - LAYA_HOST=laya-core
       - LAYA_PORT=8000
       - LAYA_MCP_LISTEN=0.0.0.0
       - LAYA_MCP_PORT=8001
-    networks:
-      - unsloth-net
+    # CORREZIONE: Rimosso /opt/venv/bin/
+    command: laya-mcp-server
     ports:
       - "8001:8001"
+    networks:
+      - unsloth-net
     restart: unless-stopped
-
-volumes:
-  laya_cache:
 
 networks:
   unsloth-net:
     external: true
+
+volumes:
+  laya_cache:
