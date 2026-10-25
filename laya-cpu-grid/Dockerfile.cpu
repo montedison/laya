@@ -12,26 +12,21 @@ RUN apt-get update && apt-get install -y git build-essential && rm -rf /var/lib/
 # Copia dell'intero contesto
 COPY . .
 
-# Installazione dipendenze: torch 2.4.0 + laya
+# --- SOLUZIONE DEFINITIVA DEL CONFLITTO ---
+# 1. Usiamo torch 2.5.1 (più recente di 2.4.0) per soddisfare i requisiti di transformers
+# 2. Installiamo laya che porterà le versioni corrette di transformers
 RUN uv pip install --system \
     --extra-index-url https://download.pytorch.org/whl/cpu \
     --index-strategy unsafe-best-match \
-    torch==2.4.0 ".[serve,mcp]"
-
-# --- TOTAL SURGICAL PATCH (Fix for transformers bug) ---
-# Il bug è un NameError causato da Type Hints (torch.Tensor, nn.Module, torch.device)
-# in un modulo che viene caricato quando torch è "disabilitato".
-# Sostituiamo tutti i riferimenti problematici con tipi Python standard.
-RUN sed -i 's/nn.Module/object/g' /usr/local/lib/python3.11/site-packages/transformers/integrations/accelerate.py && \
-    sed -i 's/torch.Tensor/object/g' /usr/local/lib/python3.11/site-packages/transformers/integrations/accelerate.py && \
-    sed -i 's/torch.device/str/g' /usr/local/lib/python3.11/site-packages/transformers/integrations/accelerate.py
+    torch==2.5.1 \
+    ".[serve,mcp]"
 
 # STAGE 2: Runtime
 FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
-# Copia dell'ambiente installato e PATCHATO dal builder
+# Copia dell'ambiente installato dal builder
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY . /app/
