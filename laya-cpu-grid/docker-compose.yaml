@@ -29,7 +29,7 @@ services:
       - LAYA_PORT=8000
       - LAYA_MCP_LISTEN=0.0.0.0
       - LAYA_MCP_PORT=8001
-    command: ["laya-mcp-server"]
+    command: ["laya-mcp-serve"]
     restart: unless-stopped
     networks:
       - unsloth-net
