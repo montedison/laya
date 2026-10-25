@@ -7,7 +7,7 @@ All notable changes to the `laya-onnx` crate are documented here. The format fol
 ## [0.1.0] - unreleased
 
 First release: a port of the Laya Python SDK, checked against goldens and routing probes
-regenerated from laya (Python) 0.4.11 for the supported paths (see the known gaps below).
+regenerated from laya (Python) 0.4.14 for the supported paths (see the known gaps below).
 
 ### Added
 
@@ -96,11 +96,15 @@ regenerated from laya (Python) 0.4.11 for the supported paths (see the known gap
   confirmed by the `Sent:`/`Enviado:`/`Date:` line after them), the wrapped-attribution tail,
   Portuguese/Spanish/French sign-offs, the English sign-off name rule, device and mail-app footers,
   and Portuguese/Spanish/French disclaimers. A bare `From:` line that opens a sentence is kept.
+- Language detection follows Python 0.4.14: the English stop list counts question words, auxiliaries,
+  pronouns and connectives (116 words, up from 34), so a short request such as "Why hasn't my card
+  been delivered?" is read as English instead of staying undecided and taking the multilingual
+  checkpoint. The opt-in `explain` diagnostics Python added in 0.4.14 are not ported.
 - Dependency: `unicode-normalization` (canonical combining classes for `unicodedata.combining`).
 
 ### Known gaps
 
-- Language detection, routing and email cleaning follow the regenerated Python 0.4.11 probes; a
+- Language detection, routing and email cleaning follow the regenerated Python 0.4.14 probes; a
   later Python change needs the probes regenerated.
 - Not yet ported: abstention (`min_confidence`, including per-bucket thresholds),
   histogram-binning calibration and `lang_temperatures`.

@@ -761,7 +761,7 @@ Rust port groups the corresponding functions into a unit struct with associated 
 
 ## Known gaps
 
-- **Language detection, routing and email cleaning follow Python 0.4.12** and are checked against
+- **Language detection, routing and email cleaning follow Python 0.4.14** and are checked against
   routing probes and a seeded differential corpus regenerated at that version
   (`tools/regen_golden.py --checkpoint routing`). A later Python change needs them regenerated.
 

@@ -94,33 +94,36 @@ The shipped checkpoints work zero-shot, but fine-tuning on decisions from your o
 
 **[nandhakishorm.github.io/laya](https://nandhakishorm.github.io/laya/)**: guides for [prediction hooks](https://nandhakishorm.github.io/laya/hooks/), [schema-driven decisions](https://nandhakishorm.github.io/laya/structured/), [Docker](https://nandhakishorm.github.io/laya/docker/) and [LangChain and LangGraph](https://nandhakishorm.github.io/laya/langchain/), plus a full [API reference](https://nandhakishorm.github.io/laya/reference/).
 
-## What's new in 0.4.14
+## What's new in 0.4.15
 
-* **Plain English questions stop going to the multilingual checkpoint.** Nothing in "Why hasn't my
-  card been delivered?" was on the 34-word English function list, so it read as undecided and took
-  the router default. 82 closed-class words are now on that list: question words, auxiliaries,
-  what `_WORD` leaves of a contraction, and common determiners and connectives. That is 589 of the
-  2,974 MASSIVE en-US test rows, and on the rows that move the English checkpoint answers better
-  (283 against 214 head to head, sign test p=0.002). Content words stay out, because a foreign
-  sentence borrows those. No row moves off the English checkpoint, and 15 of 148,700 non-English
-  MASSIVE rows move onto it, 11 of them English titles (#1315). All four SDKs carry the same list.
-* **A Go SDK you can route with.** `laya-go` gains the routing half of `laya.router` with
-  `Route`/`RouteBatch` and `on_route` hooks, the `laya.email` port, presets and the embedding
-  shortlist, a calibration payload installed at `Open`, and runnable quickstart and benchmark
-  samples (#1310, #1311, #1308, #1307, #1306, #1309).
-* **Four more fail-closed guards in the integrations.** A remote decision body that is valid JSON
-  but not an object now raises instead of leaking `AttributeError` in LangChain, CrewAI and
-  LlamaIndex (#1301). A probability that is not a real number, or is a bool, routes to the
-  `fallback_tool` rather than raising out of `float()` (#1300), and the guardrail score rail
-  degrades instead of crashing on a malformed `probabilities` block (#1302).
-* **`calibrate_reliability` refuses evidence it cannot fit**: mismatched lengths, a score outside
-  [0, 1], a non-finite score, and a label that is not a boolean (#1314). NumPy booleans and reals
-  count, since `preds == gold` is how correctness is usually computed.
-* **`probabilities` are rounded independently and need not sum to 1.** Three equally likely options
-  come back as `0.3333` each, totalling `0.9999`. Now documented in both the in-process and HTTP
-  references, where a strict unit-sum check would have been written against it (#1305).
-* **pydecide joins Community Tools.** Local inference is its default now, and hosted backends have
-  to be asked for by name rather than appearing because an API key is in the environment (#1304).
+* **The HTTP server fails closed instead of hanging or over-reading.** A stalled upload no longer
+  holds its slot forever, because the request-body read is bounded (#1331). A caller `batch_size`
+  may shrink a pass but never widen one, so a large value cannot force a bigger allocation than
+  the server chose (#1332). When `LAYA_API_KEY` is set, FastAPI's own `/docs`, `/redoc` and
+  `/openapi.json` stop being served, which per-route auth never covered (#1333).
+* **The TypeScript port matches Python where it used to drift.** All-caps lines no longer read as
+  French or Portuguese (#1336), a detected `en` reaches `lang_temperatures.en` (#1337), `maxLen`
+  and `headMaxLen` reach `Router.predict` (#1338), per-call hooks reach `decideBatch` (#1340),
+  batch contexts end in reverse start order (#1339), floats at or above 1e16 are spelled as
+  CPython spells them (#1341), and `analyse` reports the state and rounds rates Python's way
+  (#1330).
+* **Bad input is refused where it enters, not several frames later.** An evals threshold names its
+  own metric, and `noul_accuracy` is no longer confused with `choice_accuracy` (#1317). A gate
+  policy or evidence artifact nested too deep for JSON is a usage error naming its file rather
+  than a crash (#1318, #1320), an unreadable dataset is a usage error rather than a traceback
+  (#1319), a dataset row that is not a row is an `EvalError` (#1322), and a remote `answers` field
+  that is not an object is refused across the integrations (#1321, #1335).
+* **Script detection is exact across newer Unicode and faster.** Letters the running
+  interpreter's Unicode database does not know are counted anyway, so text in a script added after
+  the interpreter's database still reports its own script instead of nothing (#1334). The range
+  scan is now a binary search over flattened ranges, verified to agree with the old scan at every
+  one of the 1114112 code points (#1349).
+* **Java and .NET hold their resources correctly.** `AgentConfig`'s temperature table is copied
+  rather than aliased (#1327), the ONNX session options and a half-built split graph are closed
+  (#1328), nothing that can throw sits between taking a router lease and releasing it (#1329), and
+  .NET parses and re-emits JSON without recursion so depth cannot overflow the stack (#1346).
+* **Shortlist cosines are clipped to the documented [-1, 1]** in Rust and .NET, where accumulated
+  float error could put them just outside (#1344).
 
 Earlier releases are in the [GitHub releases](https://github.com/NandhaKishorM/laya/releases).
 
