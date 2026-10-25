@@ -1,45 +1,68 @@
-# STAGE 1: Builder
+# ==========================================
+# STAGE 1: Builder (Costruzione dell'ambiente)
+# ==========================================
 FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
-# Installazione dipendenze di sistema
-RUN apt-get update && apt-get install -y git build-essential && rm -rf /var/lib/apt/lists/*
+# 1. Installazione dipendenze di sistema per la compilazione
+RUN apt-get update && apt-get install -y \
+    git \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# Installazione di uv per velocità estrema
+# 2. Installazione di uv (strumento di gestione pacchetti ultra-veloce)
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-# Copia dei file di progetto dalla ROOT (grazie al context: ..)
+# 3. Copia solo i file di configurazione delle dipendenze
+# Questo crea uno strato (layer) di cache. Se non tocchi uv.lock, 
+# il download di PyTorch non verrà mai ripetuto.
 COPY pyproject.toml uv.lock ./
 
-# Installazione dipendenze CPU-only
+# 4. Installazione delle dipendenze pesanti (CPU-only)
+# Usiamo --extra-index-url e --index-strategy per risolvere il problema di idna/transformers
 RUN uv pip install --system \
     --extra-index-url https://download.pytorch.org/whl/cpu \
     --index-strategy unsafe-best-match \
-    torch==2.4.0 ".[serve,mcp]"
+    torch==2.4.0
 
-# STAGE 2: Runtime
+# 5. COPIA DEL CODICE SORGENTE
+# Ora che le dipendenze pesanti sono installate, copiamo tutto il resto.
+# Questo include la cartella /laya, il README.md e i file necessari per il build locale.
+COPY . .
+
+# 6. Installazione del pacchetto locale 'laya' con i suoi extras
+# Ora il comando ".[serve,mcp]" funzionerà perché trova la cartella /build/laya/
+RUN uv pip install --system ".[serve,mcp]"
+
+
+# ==========================================
+# STAGE 2: Runtime (Esecuzione sicura e leggera)
+# ==========================================
 FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
-# Copia dell'ambiente virtuale dal builder
+# 1. Copia solo i pacchetti installati e i binari dallo stadio builder
+# Questo mantiene l'immagine finale piccola (senza build-essential o cache di uv)
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copia di TUTTO il contenuto della ROOT (codice, config, ecc.)
-COPY . /app/
+# 2. Copia il codice sorgente per l'esecuzione
+COPY . .
 
-# Configurazione ambiente ottimizzata per CPU
-ENV PATH="/app/.venv/bin:$PATH"
+# 3. Configurazione ambiente (le tue variabili originali)
 ENV LAYA_DEVICE="cpu"
 ENV LAYA_THREADS="4"
 ENV HF_HUB_CACHE="/data/huggingface"
+# Nota: Non serve PATH="/app/.venv/bin:$PATH" perché usiamo --system (i binari sono in /usr/local/bin)
 
-# Creazione utente non-root
+# 4. Sicurezza: Creazione utente non-root
 RUN useradd -m layauser
 USER layauser
 
+# 5. Gestione dati e persistenza
 VOLUME ["/data/huggingface"]
 
+# 6. Punto di ingresso del servizio
 ENTRYPOINT ["laya-serve"]
