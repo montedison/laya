@@ -9,29 +9,30 @@ WORKDIR /build
 # Installazione dipendenze di sistema
 RUN apt-get update && apt-get install -y git build-essential && rm -rf /var/lib/apt/lists/*
 
-# Copia dei file di progetto
+# Copia dell'intero contesto (necessario per l'installazione del pacchetto locale)
 COPY . .
 
-# --- CORREZIONE STACK DIPENDENZE ---
-# Forziamo una versione di transformers compatibile con torch 2.4.0
-# per evitare il bug di disabilitazione e il NameError 'nn'
+# Installazione dipendenze: 
+# 1. Installiamo torch 2.4.0
+# 2. Installiamo laya (che porterà con sé transformers >= 4.48.0)
 RUN uv pip install --system \
     --extra-index-url https://download.pytorch.org/whl/cpu \
     --index-strategy unsafe-best-match \
-    torch==2.4.0 \
-    transformers==4.44.2 \
-    ".[serve,mcp]"
+    torch==2.4.0 ".[serve,mcp]"
+
+# --- SURGICAL PATCH (Fix for transformers bug) ---
+# Il bug causa NameError: 'nn' is not defined in accelerate.py quando torch < 2.6
+# Sostituiamo 'nn.Module' con 'object' per bypassare il riferimento al modulo non importato.
+RUN sed -i 's/nn.Module/object/g' /usr/local/lib/python3.11/site-packages/transformers/integrations/accelerate.py
 
 # STAGE 2: Runtime
 FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
-# Copia dell'ambiente installato dal builder
+# Copia dell'ambiente (incluso il pacchetto transformers patchato) dal builder
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
-
-# Copia del codice sorgente
 COPY . /app/
 
 # Configurazione ambiente
