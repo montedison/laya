@@ -6,9 +6,12 @@ services:
       dockerfile: laya-cpu-grid/Dockerfile.cpu
     image: laya-inference-engine
     container_name: laya-inference-engine
-    # CORREZIONE: Forza l'esecuzione come root per permettere la scrittura sul volume laya_cache
+    # Usiamo root solo per il momento iniziale del boot per gestire il volume
     user: root
-    command: laya-serve
+    # Il comando: 1. Sistema i permessi -> 2. Scende di privilegi -> 3. Lancia l'app
+    command: >
+      /bin/sh -c "chown -R layauser:layauser /data/huggingface && 
+      exec su layauser -c 'laya-serve'"
     environment:
       - LAYA_DEVICE=cpu
       - LAYA_THREADS=4
@@ -26,6 +29,8 @@ services:
   laya-mcp-bridge:
     image: laya-inference-engine
     container_name: laya-mcp-bridge
+    # Il bridge non scrive sul volume, quindi può girare direttamente come utente sicuro
+    user: layauser
     depends_on:
       - laya-core
     environment:
