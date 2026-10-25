@@ -6,7 +6,8 @@ services:
       dockerfile: laya-cpu-grid/Dockerfile.cpu
     image: laya-inference-engine
     container_name: laya-inference-engine
-    # CORREZIONE: Rimosso /opt/venv/bin/
+    # CORREZIONE: Forza l'esecuzione come root per permettere la scrittura sul volume laya_cache
+    user: root
     command: laya-serve
     environment:
       - LAYA_DEVICE=cpu
@@ -28,12 +29,10 @@ services:
     depends_on:
       - laya-core
     environment:
-      # LAYA_HOST punta al nome del SERVICE (laya-core)
       - LAYA_HOST=laya-core
       - LAYA_PORT=8000
       - LAYA_MCP_LISTEN=0.0.0.0
       - LAYA_MCP_PORT=8001
-    # CORREZIONE: Rimosso /opt/venv/bin/
     command: laya-mcp-server
     ports:
       - "8001:8001"
