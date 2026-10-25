@@ -13,12 +13,12 @@ RUN apt-get update && apt-get install -y git build-essential && rm -rf /var/lib/
 COPY . .
 
 # --- SOLUZIONE DEFINITIVA DEL CONFLITTO ---
-# 1. Usiamo torch 2.5.1 (più recente di 2.4.0) per soddisfare i requisiti di transformers
+# 1. Usiamo torch aggiornato e vediamo come va per soddisfare i requisiti di transformers
 # 2. Installiamo laya che porterà le versioni corrette di transformers
 RUN uv pip install --system \
     --extra-index-url https://download.pytorch.org/whl/cpu \
     --index-strategy unsafe-best-match \
-    torch==2.5.1 \
+    torch \
     ".[serve,mcp]"
 
 # STAGE 2: Runtime
