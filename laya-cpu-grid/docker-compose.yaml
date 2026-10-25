@@ -25,7 +25,11 @@ services:
     environment:
       - LAYA_HOST=laya-core
       - LAYA_PORT=8000
+      - LAYA_MCP_LISTEN=0.0.0.0
+      - LAYA_MCP_PORT=8001
     command: ["laya-mcp-server"]
+    ports:
+      - "8001:8001"
     restart: unless-stopped
 
 volumes:
