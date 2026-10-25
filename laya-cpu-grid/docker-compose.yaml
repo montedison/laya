@@ -1,11 +1,13 @@
 services:
   laya-core:
     build:
-      context: ..                # Punta alla root del repository (laya/)
+      context: ..
       dockerfile: laya-cpu-grid/Dockerfile.cpu
-    image: laya-inference-engine # Nome esplicito per permettere il riuso
+    image: laya-inference-engine
     container_name: laya-inference-engine
     restart: unless-stopped
+    # FIX: Dobbiamo dare un comando al core, altrimenti non fa nulla
+    entrypoint: ["/opt/venv/bin/laya-serve"]
     environment:
       - LAYA_DEVICE=cpu
       - LAYA_THREADS=4
@@ -18,27 +20,30 @@ services:
     ports:
       - "8000:8000"
 
-  # Il Bridge di Comunicazione (IO-Heavy)
+  # Il Bridge di Comunicazione (Ora finalmente funzionante)
   laya-mcp-bridge:
-    image: laya-inference-engine # Usa l'immagine costruita sopra
+    image: laya-inference-engine
     container_name: laya-mcp-bridge
     depends_on:
       - laya-core
+    # FIX: Sovrascriviamo l'entrypoint per bypassare il fallimentare entrypoint.py
+    entrypoint: ["/opt/venv/bin/laya-mcp-serve"]
+    # I parametri passati al comando diventano argomenti per laya-mcp-server
+    command: ["--host", "0.0.0.0", "--port", "8001"]
     environment:
       - LAYA_HOST=laya-core
       - LAYA_PORT=8000
       - LAYA_MCP_LISTEN=0.0.0.0
       - LAYA_MCP_PORT=8001
-    command: ["laya-mcp-server", "--host", "0.0.0.0", "--port", "8001"]
-    ports:
-      - "8001:8001"
     networks:
       - unsloth-net
+    ports:
+      - "8001:8001"
     restart: unless-stopped
+
+volumes:
+  laya_cache:
 
 networks:
   unsloth-net:
     external: true
-    
-volumes:
-  laya_cache:
