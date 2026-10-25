@@ -29,7 +29,7 @@ services:
       - LAYA_PORT=8000
       - LAYA_MCP_LISTEN=0.0.0.0
       - LAYA_MCP_PORT=8001
-    command: ["laya-mcp-serve", "--host", "0.0.0.0", "--port", "8001"]
+    command: ["laya-mcp-server", "--host", "0.0.0.0", "--port", "8001"]
     ports:
       - "8001:8001"
     networks:
