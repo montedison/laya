@@ -14,7 +14,7 @@ services:
     volumes:
       - laya_cache:/data/huggingface
     networks:
-      - dokploy-network
+      - unsloth-net
     ports:
       - "8000:8000"
 
@@ -32,12 +32,12 @@ services:
     command: ["laya-mcp-serve"]
     restart: unless-stopped
     networks:
-      - dokploy-network
+      - unsloth-net
     ports:
       - "8001:8001"
 
 networks:
-  dokploy-network:
+  unsloth-net:
     external: true
     
 volumes:
