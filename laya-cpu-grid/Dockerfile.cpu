@@ -32,8 +32,8 @@ RUN uv pip install --system \
 COPY . .
 
 # 6. Installazione del pacchetto locale 'laya' con i suoi extras
-# Ora il comando ".[serve,mcp]" funzionerà perché trova la cartella /build/laya/
-RUN uv pip install --system ".[serve,mcp]"
+# Ora il comando ".[server,mcp]" funzionerà perché trova la cartella /build/laya/
+RUN uv pip install --system ".[server,mcp]"
 
 
 # ==========================================
@@ -65,4 +65,4 @@ USER layauser
 VOLUME ["/data/huggingface"]
 
 # 6. Punto di ingresso del servizio
-ENTRYPOINT ["laya-serve"]
+ENTRYPOINT ["laya-server"]
