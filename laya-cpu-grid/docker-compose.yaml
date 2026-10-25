@@ -11,12 +11,13 @@ services:
       /bin/sh -c "chown -R layauser:layauser /data/huggingface && 
       exec su layauser -c 'laya-serve'"
     environment:
-      - LAYA_DEVICE=${LAYA_DEVICE}
-      - LAYA_THREADS=${LAYA_THREADS}
-      - LAYA_PRELOAD=${LAYA_PRELOAD}
-      - LAYA_MODEL_ID=${LAYA_MODEL_ID}
+      # Se l'env non esiste, usa 'cpu' come default
+      - LAYA_DEVICE=${LAYA_DEVICE:-cpu}
+      - LAYA_THREADS=${LAYA_THREADS:-4}
+      - LAYA_PRELOAD=${LAYA_PRELOAD:-1}
+      - LAYA_MODEL_ID=${LAYA_MODEL_ID:-convaiinnovations/laya}
       - HF_HUB_CACHE=/data/huggingface
-      - HF_TOKEN=${HF_TOKEN}
+      - HF_TOKEN=${HF_TOKEN:-}
     volumes:
       - laya_cache:/data/huggingface
     ports:
@@ -35,11 +36,12 @@ services:
     environment:
       - LAYA_HOST=laya-core
       - LAYA_PORT=8000
-      - LAYA_MCP_LISTEN=${LAYA_MCP_LISTEN}
-      - LAYA_MCP_PORT=${LAYA_MCP_PORT}
+      - LAYA_MCP_LISTEN=${LAYA_MCP_LISTEN:-0.0.0.0}
+      - LAYA_MCP_PORT=${LAYA_MCP_PORT:-8001}
     command: laya-mcp-server
     ports:
-      - "${LAYA_MCP_PORT}:${LAYA_MCP_PORT}"
+      # Se la variabile è vuota, usa 8001:8001 di default
+      - "${LAYA_MCP_PORT:-8001}:${LAYA_MCP_PORT:-8001}"
     networks:
       - unsloth-net
     restart: unless-stopped
