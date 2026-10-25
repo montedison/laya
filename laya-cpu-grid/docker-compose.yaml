@@ -13,6 +13,8 @@ services:
       - HF_HUB_CACHE=/data/huggingface
     volumes:
       - laya_cache:/data/huggingface
+    networks:
+      - unsloth-net
     ports:
       - "8000:8000"
 
