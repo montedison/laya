@@ -6,17 +6,17 @@ services:
       dockerfile: laya-cpu-grid/Dockerfile.cpu
     image: laya-inference-engine
     container_name: laya-inference-engine
-    # Usiamo root solo per il momento iniziale del boot per gestire il volume
     user: root
-    # Il comando: 1. Sistema i permessi -> 2. Scende di privilegi -> 3. Lancia l'app
     command: >
       /bin/sh -c "chown -R layauser:layauser /data/huggingface && 
       exec su layauser -c 'laya-serve'"
     environment:
-      - LAYA_DEVICE=cpu
-      - LAYA_THREADS=4
-      - LAYA_PRELOAD=1
+      - LAYA_DEVICE=${LAYA_DEVICE}
+      - LAYA_THREADS=${LAYA_THREADS}
+      - LAYA_PRELOAD=${LAYA_PRELOAD}
+      - LAYA_MODEL_ID=${LAYA_MODEL_ID}
       - HF_HUB_CACHE=/data/huggingface
+      - HF_TOKEN=${HF_TOKEN}
     volumes:
       - laya_cache:/data/huggingface
     ports:
@@ -29,18 +29,17 @@ services:
   laya-mcp-bridge:
     image: laya-inference-engine
     container_name: laya-mcp-bridge
-    # Il bridge non scrive sul volume, quindi può girare direttamente come utente sicuro
     user: layauser
     depends_on:
       - laya-core
     environment:
       - LAYA_HOST=laya-core
       - LAYA_PORT=8000
-      - LAYA_MCP_LISTEN=0.0.0.0
-      - LAYA_MCP_PORT=8001
+      - LAYA_MCP_LISTEN=${LAYA_MCP_LISTEN}
+      - LAYA_MCP_PORT=${LAYA_MCP_PORT}
     command: laya-mcp-server
     ports:
-      - "8001:8001"
+      - "${LAYA_MCP_PORT}:${LAYA_MCP_PORT}"
     networks:
       - unsloth-net
     restart: unless-stopped
