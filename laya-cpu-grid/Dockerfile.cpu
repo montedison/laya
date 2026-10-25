@@ -1,68 +1,43 @@
-# ==========================================
-# STAGE 1: Builder (Costruzione dell'ambiente)
-# ==========================================
-FROM python:3.11-slim AS builder
+# STAGE 1: Builder
+FROM ghcr.io/astral-sh/uv:latest AS builder
 
 WORKDIR /build
 
-# 1. Installazione dipendenze di sistema per la compilazione
-RUN apt-get update && apt-get install -y \
-    git \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
+# Installazione dipendenze di sistema
+RUN apt-get update && apt-get install -y git build-essential && rm -rf /var/lib/apt/lists/*
 
-# 2. Installazione di uv (strumento di gestione pacchetti ultra-veloce)
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
-# 3. Copia solo i file di configurazione delle dipendenze
-# Questo crea uno strato (layer) di cache. Se non tocchi uv.lock, 
-# il download di PyTorch non verrà mai ripetuto.
+# Copia dei file di progetto
 COPY pyproject.toml uv.lock ./
 
-# 4. Installazione delle dipendenze pesanti (CPU-only)
-# Usiamo --extra-index-url e --index-strategy per risolvere il problema di idna/transformers
+# Installazione dipendenze CPU-only
 RUN uv pip install --system \
     --extra-index-url https://download.pytorch.org/whl/cpu \
     --index-strategy unsafe-best-match \
-    torch==2.4.0
+    torch==2.4.0 ".[serve,mcp]"
 
-# 5. COPIA DEL CODICE SORGENTE
-# Ora che le dipendenze pesanti sono installate, copiamo tutto il resto.
-# Questo include la cartella /laya, il README.md e i file necessari per il build locale.
-COPY . .
-
-# 6. Installazione del pacchetto locale 'laya' con i suoi extras
-# Ora il comando ".[serve,mcp]" funzionerà perché trova la cartella /build/laya/
-RUN uv pip install --system ".[serve,mcp]"
-
-
-# ==========================================
-# STAGE 2: Runtime (Esecuzione sicura e leggera)
-# ==========================================
+# STAGE 2: Runtime
 FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
-# 1. Copia solo i pacchetti installati e i binari dallo stadio builder
-# Questo mantiene l'immagine finale piccola (senza build-essential o cache di uv)
+# Copia dell'ambiente dal builder
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# 2. Copia il codice sorgente per l'esecuzione
-COPY . .
+# Copia del codice
+COPY . /app/
 
-# 3. Configurazione ambiente (le tue variabili originali)
+# Configurazione ambiente
+ENV PATH="/usr/local/bin:$PATH"
 ENV LAYA_DEVICE="cpu"
 ENV LAYA_THREADS="4"
 ENV HF_HUB_CACHE="/data/huggingface"
-# Nota: Non serve PATH="/app/.venv/bin:$PATH" perché usiamo --system (i binari sono in /usr/local/bin)
 
-# 4. Sicurezza: Creazione utente non-root
+# --- SECURITY LAYER ---
+# Creazione utente non-privilegiato
 RUN useradd -m layauser
-USER layauser
 
-# 5. Gestione dati e persistenza
-VOLUME ["/data/huggingface"]
+# Preparazione directory cache (per prevenire errori di mkdir)
+RUN mkdir -p /data/huggingface && chown -R layauser:layauser /data/huggingface
 
-# 6. Punto di ingresso del servizio
-ENTRYPOINT ["laya-serve"]
+# L'utente di default rimane root per permettere il pattern di de-escalation nel compose
