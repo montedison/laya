@@ -18,10 +18,12 @@ RUN uv pip install --system \
     --index-strategy unsafe-best-match \
     torch==2.4.0 ".[serve,mcp]"
 
-# --- DOUBLE SURGICAL PATCH (Fix for transformers bug) ---
-# 1. Fix NameError: 'nn' is not defined
-# 2. Fix NameError: 'torch' is not defined
+# --- TOTAL SURGICAL PATCH (Fix for transformers bug) ---
+# Il bug è un NameError causato da Type Hints (torch.Tensor, nn.Module, torch.device)
+# in un modulo che viene caricato quando torch è "disabilitato".
+# Sostituiamo tutti i riferimenti problematici con tipi Python standard.
 RUN sed -i 's/nn.Module/object/g' /usr/local/lib/python3.11/site-packages/transformers/integrations/accelerate.py && \
+    sed -i 's/torch.Tensor/object/g' /usr/local/lib/python3.11/site-packages/transformers/integrations/accelerate.py && \
     sed -i 's/torch.device/str/g' /usr/local/lib/python3.11/site-packages/transformers/integrations/accelerate.py
 
 # STAGE 2: Runtime
