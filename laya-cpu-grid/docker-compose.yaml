@@ -28,9 +28,15 @@ services:
       - LAYA_MCP_LISTEN=0.0.0.0
       - LAYA_MCP_PORT=8001
     command: ["laya-mcp-server"]
+    restart: unless-stopped
+    networks:
+      - unsloth-net
     ports:
       - "8001:8001"
-    restart: unless-stopped
 
+networks:
+  unsloth-net:
+    external: true
+    
 volumes:
   laya_cache:
