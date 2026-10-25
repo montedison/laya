@@ -94,36 +94,18 @@ The shipped checkpoints work zero-shot, but fine-tuning on decisions from your o
 
 **[nandhakishorm.github.io/laya](https://nandhakishorm.github.io/laya/)**: guides for [prediction hooks](https://nandhakishorm.github.io/laya/hooks/), [schema-driven decisions](https://nandhakishorm.github.io/laya/structured/), [Docker](https://nandhakishorm.github.io/laya/docker/) and [LangChain and LangGraph](https://nandhakishorm.github.io/laya/langchain/), plus a full [API reference](https://nandhakishorm.github.io/laya/reference/).
 
-## What's new in 0.4.15
+## What's new in 0.4.16
 
-* **The HTTP server fails closed instead of hanging or over-reading.** A stalled upload no longer
-  holds its slot forever, because the request-body read is bounded (#1331). A caller `batch_size`
-  may shrink a pass but never widen one, so a large value cannot force a bigger allocation than
-  the server chose (#1332). When `LAYA_API_KEY` is set, FastAPI's own `/docs`, `/redoc` and
-  `/openapi.json` stop being served, which per-route auth never covered (#1333).
-* **The TypeScript port matches Python where it used to drift.** All-caps lines no longer read as
-  French or Portuguese (#1336), a detected `en` reaches `lang_temperatures.en` (#1337), `maxLen`
-  and `headMaxLen` reach `Router.predict` (#1338), per-call hooks reach `decideBatch` (#1340),
-  batch contexts end in reverse start order (#1339), floats at or above 1e16 are spelled as
-  CPython spells them (#1341), and `analyse` reports the state and rounds rates Python's way
-  (#1330).
-* **Bad input is refused where it enters, not several frames later.** An evals threshold names its
-  own metric, and `noul_accuracy` is no longer confused with `choice_accuracy` (#1317). A gate
-  policy or evidence artifact nested too deep for JSON is a usage error naming its file rather
-  than a crash (#1318, #1320), an unreadable dataset is a usage error rather than a traceback
-  (#1319), a dataset row that is not a row is an `EvalError` (#1322), and a remote `answers` field
-  that is not an object is refused across the integrations (#1321, #1335).
-* **Script detection is exact across newer Unicode and faster.** Letters the running
-  interpreter's Unicode database does not know are counted anyway, so text in a script added after
-  the interpreter's database still reports its own script instead of nothing (#1334). The range
-  scan is now a binary search over flattened ranges, verified to agree with the old scan at every
-  one of the 1114112 code points (#1349).
-* **Java and .NET hold their resources correctly.** `AgentConfig`'s temperature table is copied
-  rather than aliased (#1327), the ONNX session options and a half-built split graph are closed
-  (#1328), nothing that can throw sits between taking a router lease and releasing it (#1329), and
-  .NET parses and re-emits JSON without recursion so depth cannot overflow the stack (#1346).
-* **Shortlist cosines are clipped to the documented [-1, 1]** in Rust and .NET, where accumulated
-  float error could put them just outside (#1344).
+* **Rust and .NET answer batches, and abstain, the way Python does.** `predict_batch` and the
+  router batch APIs are ported to both, grouping by checkpoint and question schema and restoring
+  input order (#1358, #1359). The `min_confidence` abstention gate and `jev_confidence` follow, so
+  a low-confidence answer abstains identically in every port (#1362, #1363). Both sets are checked
+  against goldens recorded from the Python package rather than hand-written tables.
+* **Four inputs are now refused where they enter instead of failing later.** A non-numeric or
+  overflowing `hooks_timeout` is a `ValueError` at the call (#1365), an unhashable tournament
+  choice label is a 422 rather than a 500 (#1366), a question or batch file that cannot be read
+  names the file and exits 2 rather than printing a traceback (#1367), and an answer that is not
+  an object is left out of a structured projection rather than ending the call (#1368).
 
 Earlier releases are in the [GitHub releases](https://github.com/NandhaKishorM/laya/releases).
 
