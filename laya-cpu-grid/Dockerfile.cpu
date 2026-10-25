@@ -1,33 +1,36 @@
-# STAGE 1: Builder (Usiamo un'immagine completa che ha la shell e apt)
+# STAGE 1: Builder
 FROM python:3.11-slim AS builder
 
-# Installiamo UV copiandolo dall'immagine ufficiale (Iniezione del binario)
+# Installazione di UV copiandolo dall'immagine ufficiale
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 WORKDIR /build
 
-# Installazione dipendenze di sistema (Ora funzionerà perché c'è /bin/sh)
+# Installazione dipendenze di sistema
 RUN apt-get update && apt-get install -y git build-essential && rm -rf /var/lib/apt/lists/*
 
-# Copia dei file di progetto
-COPY pyproject.toml uv.lock ./
+# --- CORREZIONE CRUCIALE ---
+# Copiamo l'intero contesto del progetto nel builder. 
+# Senza la cartella 'laya/' e il 'README.md', l'installazione del pacchetto locale fallisce.
+COPY . .
 
 # Installazione dipendenze CPU-only tramite UV
+# Ora l'installazione di ".[serve,mcp]" troverà il codice sorgente in /build/laya
 RUN uv pip install --system \
     --extra-index-url https://download.pytorch.org/whl/cpu \
     --index-strategy unsafe-best-match \
     torch==2.4.0 ".[serve,mcp]"
 
-# STAGE 2: Runtime (Immagine pulita e sicura)
+# STAGE 2: Runtime
 FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
-# Copia dell'ambiente compilato dal builder
+# Copia dell'ambiente installato dal builder
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copia del codice sorgente
+# Copia del codice sorgente per l'esecuzione
 COPY . /app/
 
 # Configurazione ambiente
@@ -38,8 +41,5 @@ ENV LAYA_PRELOAD="1"
 ENV HF_HUB_CACHE="/data/huggingface"
 
 # --- SECURITY LAYER ---
-# Creazione utente non-privilegiato per il runtime
 RUN useradd -m layauser
-
-# Preparazione directory cache con permessi corretti
 RUN mkdir -p /data/huggingface && chown -R layauser:layauser /data/huggingface
