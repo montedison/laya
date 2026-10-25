@@ -65,4 +65,4 @@ USER layauser
 VOLUME ["/data/huggingface"]
 
 # 6. Punto di ingresso del servizio
-ENTRYPOINT ["laya-serve"]
+ENTRYPOINT ["laya-server"]
