@@ -1,4 +1,4 @@
 torch --index-url https://download.pytorch.org/whl/cpu
-laya[server,mcp]
+laya[serve,mcp]
 fastapi
 uvicorn
