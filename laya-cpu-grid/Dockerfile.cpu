@@ -1,43 +1,45 @@
-# STAGE 1: Builder
-FROM ghcr.io/astral-sh/uv:latest AS builder
+# STAGE 1: Builder (Usiamo un'immagine completa che ha la shell e apt)
+FROM python:3.11-slim AS builder
+
+# Installiamo UV copiandolo dall'immagine ufficiale (Iniezione del binario)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 WORKDIR /build
 
-# Installazione dipendenze di sistema
+# Installazione dipendenze di sistema (Ora funzionerà perché c'è /bin/sh)
 RUN apt-get update && apt-get install -y git build-essential && rm -rf /var/lib/apt/lists/*
 
 # Copia dei file di progetto
 COPY pyproject.toml uv.lock ./
 
-# Installazione dipendenze CPU-only
+# Installazione dipendenze CPU-only tramite UV
 RUN uv pip install --system \
     --extra-index-url https://download.pytorch.org/whl/cpu \
     --index-strategy unsafe-best-match \
     torch==2.4.0 ".[serve,mcp]"
 
-# STAGE 2: Runtime
+# STAGE 2: Runtime (Immagine pulita e sicura)
 FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
-# Copia dell'ambiente dal builder
+# Copia dell'ambiente compilato dal builder
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copia del codice
+# Copia del codice sorgente
 COPY . /app/
 
 # Configurazione ambiente
 ENV PATH="/usr/local/bin:$PATH"
 ENV LAYA_DEVICE="cpu"
 ENV LAYA_THREADS="4"
+ENV LAYA_PRELOAD="1"
 ENV HF_HUB_CACHE="/data/huggingface"
 
 # --- SECURITY LAYER ---
-# Creazione utente non-privilegiato
+# Creazione utente non-privilegiato per il runtime
 RUN useradd -m layauser
 
-# Preparazione directory cache (per prevenire errori di mkdir)
+# Preparazione directory cache con permessi corretti
 RUN mkdir -p /data/huggingface && chown -R layauser:layauser /data/huggingface
-
-# L'utente di default rimane root per permettere il pattern di de-escalation nel compose
