@@ -67,28 +67,34 @@ app.add_middleware(LayaPrimitiveMiddleware)
 @app.get("/sse")
 async def sse_endpoint(request: Request):
     """
-    SSE Endpoint Corretto (Versione Bypass).
-    Utilizza il server sottostante (_lowlevel_server) per gestire la connessione,
-    bypassando le limitazioni del wrapper MCPServer.
+    SSE Endpoint di SCANSIONE.
+    Non serve per la connessione, serve per trovare il nome corretto del metodo.
     """
-    scope = asgi_scope_var.get()
-    receive = asgi_receive_var.get()
-    send = asgi_send_var.get()
+    from laya.mcp.server import server
     
-    logger.info("[SSE] Tentativo di connessione in corso...")
+    logger.info("[DIAGNOSIS] --- INIZIO SCANSIONE ATTRIBUTI ---")
     
-    try:
-        # 1. Il context manager 'connect_sse' restituisce i due stream (lettura e scrittura)
-        async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
-            logger.info("[SSE] Sessione stabilita. Avvio gestione stream tramite low-level server...")
+    # 1. Identifichiamo l'oggetto reale
+    low_level = server._lowlevel_server
+    logger.info(f"[DIAGNOSIS] Oggetto target: {low_level}")
+    logger.info(f"[DIAGNOSIS] Tipo oggetto: {type(low_level)}")
+    
+    # 2. Elenchiamo TUTTI i metodi disponibili
+    metodi = dir(low_level)
+    logger.info(f"[DIAGNOSIS] Metodi trovati ({len(metodi)}):")
+    
+    for m in metodi:
+        # Filtriamo i metodi magici (__init__, ecc.) per pulizia
+        if not m.startswith("__"):
+            logger.info(f"  -> {m}")
             
-            # 2. IL FIX: Usiamo '_lowlevel_server' invece di 'server'
-            # Questo accede direttamente all'istanza originale dell'SDK MCP che possiede il metodo handle_connection
-            await server._lowlevel_server.handle_connection(read_stream, write_stream)
-            
-    except Exception as e:
-        logger.error(f"[SSE] Errore durante la sessione SSE: {e}", exc_info=True)
-        raise
+    logger.info("[DIAGNOSIS] --- FINE SCANSIONE ---")
+    
+    return {
+        "status": "scansione_completata",
+        "tipo_oggetto": str(type(low_level)),
+        "metodi_trovati": [m for m in metodi if not m.startswith("__")]
+    }
 
 @app.post("/message")
 async def message_endpoint(request: Request):
