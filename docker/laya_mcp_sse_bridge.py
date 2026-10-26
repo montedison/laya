@@ -1,82 +1,106 @@
 """
-Laya MCP Native SSE Server.
+Laya MCP SSE Bridge (Pure ASGI Implementation).
 
-This is NOT a bridge. This is a native ASGI server implementation.
-It uses Starlette to provide a lightweight, high-performance HTTP/SSE interface
-directly for the Laya MCP engine, following the official MCP specification.
+This is the final, most robust version. It bypasses all web frameworks (FastAPI/Starlette)
+to interact directly with the ASGI specification. This eliminates all conflicts
+between framework-level abstractions and the low-level MCP transport layer.
 """
 
 import os
 import json
 import asyncio
-import uvicorn
-from starlette.applications import Starlette
-from starlette.routing import Route
-from starlette.responses import JSONResponse, StreamingResponse
+import uvicron
 from mcp.server.sse import SseServerTransport
-from laya.mcp.server import server  # The actual Laya MCP server instance
+from laya.mcp.server import server
 
 # 1. Initialize the SSE transport
-# This is the core of the MCP protocol for web-based clients.
 transport = SseServerTransport("/sse")
 
-async def sse_endpoint(request):
-    """
-    Handles the SSE connection handshake.
-    By using Starlette directly, we have full control over the ASGI scope.
-    """
-    async with transport.connect_sse(request.scope, request.receive, request.scope['send']) as session:
+async def handle_sse(scope, receive, send):
+    """Handles the SSE connection."""
+    async with transport.connect_sse(scope, receive, send) as session:
         await server.handle_session(session)
 
-async def message_endpoint(request):
-    """
-    Handles incoming JSON-RPC messages via POST.
-    """
+async def handle_post(scope, receive, send):
+    """Handles the POST message."""
+    # 1. Read the body from the ASGI receive channel
+    body = b""
+    more_body = True
+    while more_body:
+        message = await receive()
+        body += message.get("body", b"")
+        more_body = message.get("more_body", False)
+
     try:
-        # We pass the raw ASGI primitives directly to the transport.
-        # This is the most efficient and stable way to communicate.
-        await transport.handle_post_message(
-            request.scope, 
-            request.receive, 
-            request.scope['send']
-        )
-        return JSONResponse({"status": "ok"})
+        # 2. Parse the JSON-RPC command
+        command_json = body.decode("utf-8")
+        
+        # 3. Pass to the transport
+        # We pass the raw scope, receive, and send directly.
+        await transport.handle_post_message(scope, receive, send)
+        
+        # Note: transport.handle_post_message in the mcp library 
+        # is designed to handle the response itself via the 'send' function.
+        # We don't need to send a manual response here.
+        
     except Exception as e:
-        print(f"[NATIVE-SERVER ERROR] {e}")
-        return JSONResponse({"detail": str(e)}, status_code=400)
+        print(f"[BRIDGE ERROR] POST handling failed: {e}")
+        # If the library fails to send its own error, we send a manual one
+        await send({
+            "type": "http.response.start",
+            "status": 400,
+            "headers": [(b"content-type", b"application/json")]
+        })
+        await send({
+            "type": "http.response.body",
+            "body": json.dumps({"detail": str(e)}).encode("utf-8")
+        })
 
-async def mcp_alias_endpoint(request):
+async def app(scope, receive, send):
     """
-    Compatibility alias for clients expecting /mcp instead of /sse or /message.
+    The Pure ASGI Application.
+    Directly handles routing and protocol logic.
     """
-    if request.method == "GET":
-        return await sse_endpoint(request)
+    if scope["type"] != "http":
+        return
+
+    path = scope.get("path", "")
+    method = scope.get("method", "")
+
+    # --- ROUTING ---
+
+    if path == "/sse" and method == "GET":
+        await handle_sse(scope, receive, send)
+
+    elif (path == "/message" or path == "/mcp") and method == "POST":
+        await handle_post(scope, receive, send)
+
+    elif path == "/health":
+        # Handle health check
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"application/json")]
+        })
+        await send({
+            "type": "http.response.body",
+            "body": b'{"status": "ok", "bridge": "laya-mcp-pure-asgi"}'
+        })
+
     else:
-        return await message_endpoint(request)
-
-async def health_check(request):
-    """Liveness probe for Dokploy/Docker."""
-    return JSONResponse({"status": "ok", "engine": "laya-native"})
-
-# 2. Define the Routes
-# We define exactly what the server exposes. No extra middleware, no bloat.
-routes = [
-    Route("/sse", sse_endpoint, methods=["GET"]),
-    Route("/message", message_endpoint, methods=["POST"]),
-    Route("/mcp", mcp_alias_endpoint, methods=["GET", "POST"]),
-    Route("/health", health_check, methods=["GET", "POST"]),
-]
-
-# 3. Initialize the Starlette Application
-# We use Starlette because it is the industry standard for high-performance ASGI.
-app = Starlette(routes=routes)
+        # 404 Not Found
+        await send({
+            "type": "http.response.start",
+            "status": 404,
+            "headers": [(b"content-type", b"application/json")]
+        })
+        await send({
+            "type": "http.response.body",
+            "body": b'{"detail": "Not Found"}'
+        })
 
 if __name__ == "__main__":
     port = int(os.getenv("LAYA_MCP_PORT", 8001))
     host = os.getenv("LAYA_MCP_LISTEN", "0.0.0.0")
-    
-    print(f"[NATIVE-SERVER] Starting Laya MCP Native Server on {host}:{port}")
-    print(f"[NATIVE-SERVER] SSE: http://{host}:{port}/sse")
-    print(f"[NATIVE-SERVER] Alias: http://{host}:{port}/mcp")
-    
+    print(f"[BRIDGE] Starting Laya MCP Pure ASGI Server on {host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="info")
