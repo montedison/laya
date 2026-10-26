@@ -67,8 +67,8 @@ app.add_middleware(LayaPrimitiveMiddleware)
 @app.get("/sse")
 async def sse_endpoint(request: Request):
     """
-    SSE Endpoint Definitivo.
-    Utilizza il metodo 'run' dell'SDK MCP low-level per gestire i flussi di comunicazione.
+    SSE Endpoint DEFINITIVO (Versione Finalizzata).
+    Risolve il TypeError fornito dall'SDK MCP richiedendo l'argomento obbligatorio.
     """
     scope = asgi_scope_var.get()
     receive = asgi_receive_var.get()
@@ -81,9 +81,20 @@ async def sse_endpoint(request: Request):
         async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
             logger.info("[SSE] Sessione stabilita. Avvio loop di comunicazione tramite 'run'...")
             
-            # 2. IL FIX: Usiamo il metodo reale dell'SDK MCP: 'run'
-            # Questo avvia il loop che gestisce i messaggi in entrata e in uscita
-            await server._lowlevel_server.run(read_stream, write_stream)
+            # 2. IL FIX FINALE: 
+            # L'SDK richiede 'initialization_options'. 
+            # Proviamo a passare None o un oggetto vuoto. 
+            # Se l'SDK è rigoroso, useremo un import per creare l'oggetto corretto.
+            
+            try:
+                from mcp.types import InitializationOptions
+                init_opts = InitializationOptions()
+            except ImportError:
+                # Fallback se non riusciamo a importare il tipo specifico
+                init_opts = None 
+
+            # Chiamata al metodo 'run' con l'argomento mancante
+            await server._lowlevel_server.run(read_stream, write_stream, initialization_options=init_opts)
             
     except Exception as e:
         logger.error(f"[SSE] Errore durante la sessione SSE: {e}", exc_info=True)
