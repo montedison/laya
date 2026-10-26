@@ -67,34 +67,27 @@ app.add_middleware(LayaPrimitiveMiddleware)
 @app.get("/sse")
 async def sse_endpoint(request: Request):
     """
-    SSE Endpoint di SCANSIONE.
-    Non serve per la connessione, serve per trovare il nome corretto del metodo.
+    SSE Endpoint Definitivo.
+    Utilizza il metodo 'run' dell'SDK MCP low-level per gestire i flussi di comunicazione.
     """
-    from laya.mcp.server import server
+    scope = asgi_scope_var.get()
+    receive = asgi_receive_var.get()
+    send = asgi_send_var.get()
     
-    logger.info("[DIAGNOSIS] --- INIZIO SCANSIONE ATTRIBUTI ---")
+    logger.info("[SSE] Tentativo di connessione in corso...")
     
-    # 1. Identifichiamo l'oggetto reale
-    low_level = server._lowlevel_server
-    logger.info(f"[DIAGNOSIS] Oggetto target: {low_level}")
-    logger.info(f"[DIAGNOSIS] Tipo oggetto: {type(low_level)}")
-    
-    # 2. Elenchiamo TUTTI i metodi disponibili
-    metodi = dir(low_level)
-    logger.info(f"[DIAGNOSIS] Metodi trovati ({len(metodi)}):")
-    
-    for m in metodi:
-        # Filtriamo i metodi magici (__init__, ecc.) per pulizia
-        if not m.startswith("__"):
-            logger.info(f"  -> {m}")
+    try:
+        # 1. Il context manager 'connect_sse' fornisce i due stream
+        async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
+            logger.info("[SSE] Sessione stabilita. Avvio loop di comunicazione tramite 'run'...")
             
-    logger.info("[DIAGNOSIS] --- FINE SCANSIONE ---")
-    
-    return {
-        "status": "scansione_completata",
-        "tipo_oggetto": str(type(low_level)),
-        "metodi_trovati": [m for m in metodi if not m.startswith("__")]
-    }
+            # 2. IL FIX: Usiamo il metodo reale dell'SDK MCP: 'run'
+            # Questo avvia il loop che gestisce i messaggi in entrata e in uscita
+            await server._lowlevel_server.run(read_stream, write_stream)
+            
+    except Exception as e:
+        logger.error(f"[SSE] Errore durante la sessione SSE: {e}", exc_info=True)
+        raise
 
 @app.post("/message")
 async def message_endpoint(request: Request):
