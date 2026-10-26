@@ -38,7 +38,7 @@ services:
       - LAYA_MCP_LISTEN=${LAYA_MCP_LISTEN:-0.0.0.0}
       - LAYA_MCP_PORT=${LAYA_MCP_PORT:-8001}
     # FIXED: Path updated to reflect the directory structure inside the container
-    command: python /app/laya-mcp-bridge/laya_mcp_sse_bridge.py
+    command: python /app/docker/laya_mcp_sse_bridge.py
     ports:
       - "${LAYA_MCP_PORT:-8001}:${LAYA_MCP_PORT:-8001}"
     networks:
