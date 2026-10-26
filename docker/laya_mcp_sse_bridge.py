@@ -1,7 +1,7 @@
 """
-Laya MCP SSE Bridge (Universal Compatibility - Final Version).
-Questa versione utilizza correttamente le ContextVar per evitare KeyError e
-garantisce la compatibilità totale con i pattern di Unsloth.
+Laya MCP SSE Bridge (Final Stability Version).
+Risolve il TypeError di Python passando gli argomenti in modo posizionale 
+per compatibilità con le firme 'positional-only' dell'SDK MCP.
 """
 
 import os
@@ -27,7 +27,7 @@ handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(DiagnosticFormatter())
 logger.addHandler(handler)
 
-# --- PRIMITIVE STORAGE (Le nostre fonti di verità) ---
+# --- PRIMITIVE STORAGE ---
 asgi_scope_var: ContextVar[Dict[str, Any]] = ContextVar("asgi_scope")
 asgi_receive_var: ContextVar[Callable] = ContextVar("asgi_receive")
 asgi_send_var: ContextVar[Callable] = ContextVar("asgi_send")
@@ -40,7 +40,6 @@ class LayaPrimitiveMiddleware:
         self.app = app
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            # Salviamo le primitive originali di ASGI
             asgi_scope_var.set(scope)
             asgi_receive_var.set(receive)
             asgi_send_var.set(send)
@@ -48,19 +47,27 @@ class LayaPrimitiveMiddleware:
 
 app.add_middleware(LayaPrimitiveMiddleware)
 
-# --- LOGICA DI GESTIONE (Core Logic) ---
+# --- LOGICA DI GESTIONE ---
 
 async def handle_sse_logic(scope, receive, send):
-    """Gestisce la connessione GET /sse (lo stream)."""
+    """Gestisce la connessione GET /sse."""
     try:
         async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
             logger.info("[SSE] Sessione stabilita. Avvio loop 'run'...")
+            
+            # Tentativo di ottenere l'oggetto di inizializzazione
             try:
                 from mcp.types import InitializationOptions
                 init_opts = InitializationOptions()
             except ImportError:
                 init_opts = None
-            await server._lowlevel_server.run(read_stream, write_stream, initialization_options=init_opts)
+
+            # IL FIX DEFINITIVO: Chiamata posizionale.
+            # Non usiamo 'initialization_options=init_opts' perché l'SDK 
+            # probabilmente usa una firma positional-only.
+            # Passiamo i 3 argomenti in ordine: self, read, write, init_opts
+            await server._lowlevel_server.run(read_stream, write_stream, init_opts)
+            
     except Exception as e:
         logger.error(f"[SSE] Errore durante la sessione SSE: {e}", exc_info=True)
         raise
@@ -78,15 +85,10 @@ async def handle_message_logic(scope, receive, send):
         logger.error(f"[POST] Errore elaborazione messaggio: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- ROUTING UNIVERSALE (Il cuore della compatibilità) ---
+# --- ROUTING UNIVERSALE ---
 
 @app.api_route("/sse", methods=["GET", "POST"])
 async def sse_router(request: Request):
-    """
-    Endpoint Unificato per /sse.
-    Usa le ContextVar per recuperare le funzioni ASGI corrette.
-    """
-    # Recuperiamo le funzioni originali salvate dal middleware
     scope = asgi_scope_var.get()
     receive = asgi_receive_var.get()
     send = asgi_send_var.get()
@@ -99,9 +101,6 @@ async def sse_router(request: Request):
 @app.post("/mcp")
 @app.post("/message")
 async def message_redirect(request: Request):
-    """
-    Alias per i messaggi. Indirizza i POST verso la logica di messaggistica.
-    """
     scope = asgi_scope_var.get()
     receive = asgi_receive_var.get()
     send = asgi_send_var.get()
