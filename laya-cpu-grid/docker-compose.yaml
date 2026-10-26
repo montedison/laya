@@ -11,7 +11,6 @@ services:
       /bin/sh -c "chown -R layauser:layauser /data/huggingface && 
       exec su layauser -c 'laya-serve'"
     environment:
-      # Se l'env non esiste, usa 'cpu' come default
       - LAYA_DEVICE=${LAYA_DEVICE:-cpu}
       - LAYA_THREADS=${LAYA_THREADS:-4}
       - LAYA_PRELOAD=${LAYA_PRELOAD:-1}
@@ -26,7 +25,7 @@ services:
       - unsloth-net
     restart: unless-stopped
 
-  # MCP BRIDGE (Updated for SSE/HTTP connectivity)
+  # MCP BRIDGE (Updated with correct internal path)
   laya-mcp-bridge:
     image: laya-inference-engine
     container_name: laya-mcp-bridge
@@ -38,10 +37,9 @@ services:
       - LAYA_PORT=8000
       - LAYA_MCP_LISTEN=${LAYA_MCP_LISTEN:-0.0.0.0}
       - LAYA_MCP_PORT=${LAYA_MCP_PORT:-8001}
-    # CHANGED: Using the SSE bridge script to allow HTTP/SSE communication
-    command: python /app/laya_mcp_sse_bridge.py
+    # FIXED: Path updated to reflect the directory structure inside the container
+    command: python /app/laya-mcp-bridge/laya_mcp_sse_bridge.py
     ports:
-      # Se la variabile è vuota, usa 8001:8001 di default
       - "${LAYA_MCP_PORT:-8001}:${LAYA_MCP_PORT:-8001}"
     networks:
       - unsloth-net
