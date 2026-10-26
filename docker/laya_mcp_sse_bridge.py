@@ -1,17 +1,16 @@
 """
-Laya MCP SSE Bridge (Final Production Version - Pure Response Implementation).
+Laya MCP SSE Bridge (Final Production Version - Protocol Stability).
 
 This script acts as an HTTP/SSE adapter for the Laya MCP server. 
-It avoids using 'raise HTTPException' to prevent ASGI lifecycle crashes, 
-instead returning direct JSON responses for error states.
+It uses a custom ASGI middleware to inject the 'send' function and 
+ensures that error handling does not interfere with the ASGI lifecycle.
 """
 
 import os
 import uvicorn
 from contextvars import ContextVar
 from typing import Callable, Any, Dict
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse  # Use direct responses instead of raising exceptions
+from fastapi import FastAPI, Request, HTTPException
 from mcp.server.sse import SseServerTransport
 from laya.mcp.server import server
 
@@ -22,7 +21,7 @@ asgi_send_var: ContextVar[Callable] = ContextVar("asgi_send")
 
 app = FastAPI(title="Laya MCP SSE Bridge")
 
-# 2. Middleware to inject 'send' into the scope
+# 2. Custom ASGI Middleware to inject 'send' into the scope
 class LayaSendMiddleware:
     def __init__(self, app):
         self.app = app
@@ -41,7 +40,7 @@ transport = SseServerTransport("/sse")
 async def sse_endpoint(request: Request):
     laya_send = request.scope.get("laya_send")
     if not laya_send:
-        return JSONResponse(status_code=500, content={"detail": "ASGI send function not found"})
+        return {"error": "ASGI send function not found"}
 
     async with transport.connect_sse(request.scope, request.receive, laya_send) as session:
         await server.handle_session(session)
@@ -50,21 +49,17 @@ async def sse_endpoint(request: Request):
 async def message_endpoint(request: Request):
     laya_send = request.scope.get("laya_send")
     if not laya_send:
-        return JSONResponse(status_code=500, content={"detail": "ASGI send function not found"})
+        return {"error": "ASGI send function not found"}
 
-    try:
-        await transport.handle_post_message(
-            request.scope, 
-            request.receive, 
-            laya_send
-        )
-        # Return a 200 OK for successful message processing
-        return JSONResponse(status_code=200, content={"status": "success"})
-    except Exception as e:
-        # Log the error for observability
-        print(f"[BRIDGE ERROR] Message handling failed: {e}")
-        # Return a 400 Bad Request directly instead of raising an exception
-        return JSONResponse(status_code=400, content={"detail": str(e)})
+    # We do NOT use a try-except that returns a JSONResponse here.
+    # Instead, we let the exception propagate to FastAPI's global handler.
+    # This prevents the conflict between the manual response and the ASGI 'send' call.
+    await transport.handle_post_message(
+        request.scope, 
+        request.receive, 
+        laya_send
+    )
+    return {"status": "ok"}
 
 # --- COMPATIBILITY LAYER ---
 
@@ -78,8 +73,6 @@ async def mcp_alias_endpoint(request: Request):
 @app.api_route("/health", methods=["GET", "POST"])
 async def health_check(request: Request):
     return {"status": "ok", "bridge": "laya-mcp-sse"}
-
-# -------------------------------------------------------
 
 if __name__ == "__main__":
     port = int(os.getenv("LAYA_MCP_PORT", 8001))
