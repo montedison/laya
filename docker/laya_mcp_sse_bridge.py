@@ -1,9 +1,9 @@
 """
-Laya MCP SSE Bridge (Final Production Version - Fixed).
+Laya MCP SSE Bridge (Final Production Version - ASGI Injection Fix).
 
 This script acts as an HTTP/SSE adapter for the Laya MCP server. 
-It wraps the Laya MCP stdio server into a FastAPI application, 
-exposing it via Server-Sent Events (SSE).
+It uses a custom ASGI middleware to inject the 'send' function into the 
+request scope, enabling the MCP transport to communicate via HTTP.
 """
 
 import os
@@ -15,8 +15,28 @@ from laya.mcp.server import server  # The actual Laya MCP server instance
 # 1. Initialize FastAPI application
 app = FastAPI(title="Laya MCP SSE Bridge")
 
-# 2. Initialize the SSE transport
-# The argument is the endpoint path that the client will connect to via SSE.
+# 2. ASGI Middleware to inject 'send' into the scope
+class LayaSendMiddleware:
+    """
+    Custom ASGI middleware that injects the 'send' function into the 
+    request scope. This allows FastAPI route handlers to access the 
+    low-level ASGI 'send' function via request.scope['laya_send'].
+    """
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            # Inject the 'send' function into the scope dictionary
+            # We use a unique key to avoid collisions with standard ASGI keys
+            scope["laya_send"] = send
+        await self.app(scope, receive, send)
+
+# Apply the middleware to the app
+app.add_middleware(LayaSendMiddleware)
+
+# 3. Initialize the SSE transport
+# The argument is the endpoint path for the SSE connection.
 transport = SseServerTransport("/sse")
 
 @app.get("/sse")
@@ -24,10 +44,14 @@ async def sse_endpoint(request: Request):
     """
     SSE Endpoint.
     Handles the initial connection from the MCP client. 
-    Uses the ASGI 'receive' and 'send' functions from the request scope.
+    Uses the injected 'laya_send' from the scope.
     """
-    async with transport.connect_sse(request.scope, request.receive, request.scope['send']) as session:
-        # Link the transport session to the Laya MCP server logic
+    # We retrieve the injected 'send' function from the scope
+    laya_send = request.scope.get("laya_send")
+    if not laya_send:
+        return {"error": "ASGI send function not found in scope"}, 500
+
+    async with transport.connect_sse(request.scope, request.receive, laya_send) as session:
         await server.handle_session(session)
 
 @app.post("/message")
@@ -35,12 +59,17 @@ async def message_endpoint(request: Request):
     """
     Message Endpoint.
     Handles incoming JSON-RPC messages sent by the client via HTTP POST.
-    FIX: We must pass 'receive' and 'send' from the ASGI scope to handle_post_message.
     """
+    # We retrieve the injected 'send' function from the scope
+    laya_send = request.scope.get("laya_send")
+    if not laya_send:
+        return {"error": "ASGI send function not found in scope"}, 500
+
+    # Pass the ASGI receive and send functions to the transport
     await transport.handle_post_message(
         request, 
         request.receive, 
-        request.scope['send']
+        laya_send
     )
 
 # --- COMPATIBILITY LAYER FOR UNSTOTH / MCP CLIENTS ---
@@ -48,8 +77,8 @@ async def message_endpoint(request: Request):
 @app.api_route("/mcp", methods=["GET", "POST"])
 async def mcp_alias_endpoint(request: Request):
     """
-    Alias endpoint to prevent 404 errors when clients attempt to connect via '/mcp'.
-    Routes GET to the SSE stream and POST to the message handler.
+    Alias endpoint to prevent 404 errors. 
+    Routes GET to SSE and POST to the message handler.
     """
     if request.method == "GET":
         return await sse_endpoint(request)
@@ -58,16 +87,12 @@ async def mcp_alias_endpoint(request: Request):
 
 @app.api_route("/health", methods=["GET", "POST"])
 async def health_check(request: Request):
-    """
-    Health check endpoint.
-    Supports both GET and POST to prevent 405 errors during automated monitoring.
-    """
+    """Health check endpoint supporting both GET and POST."""
     return {"status": "ok", "bridge": "laya-mcp-sse"}
 
 # -------------------------------------------------------
 
 if __name__ == "__main__":
-    # Load configuration from environment variables
     port = int(os.getenv("LAYA_MCP_PORT", 8001))
     host = os.getenv("LAYA_MCP_LISTEN", "0.0.0.0")
     
