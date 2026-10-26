@@ -9,7 +9,7 @@ between framework-level abstractions and the low-level MCP transport layer.
 import os
 import json
 import asyncio
-import uvicron
+import uvicorn
 from mcp.server.sse import SseServerTransport
 from laya.mcp.server import server
 
