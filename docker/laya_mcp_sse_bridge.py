@@ -67,29 +67,23 @@ app.add_middleware(LayaPrimitiveMiddleware)
 @app.get("/sse")
 async def sse_endpoint(request: Request):
     """
-    SSE Endpoint Corretto.
-    Utilizza il metodo 'handle_connection' dell'SDK MCP e spacchetta correttamente i flussi.
+    SSE Endpoint di DIAGNOSI.
+    Questo endpoint non serve a connettere Unsloth, ma a dirci quali metodi
+    sono disponibili sull'oggetto 'server'.
     """
-    scope = asgi_scope_var.get()
-    receive = asgi_receive_var.get()
-    send = asgi_send_var.get()
+    from laya.mcp.server import server
     
-    logger.info("[SSE] Tentativo di connessione in corso...")
+    logger.info("[DIAGNOSIS] Avvio ispezione oggetto 'server'...")
+    logger.info(f"[DIAGNOSIS] Tipo oggetto: {type(server)}")
     
-    try:
-        # 1. Il context manager 'connect_sse' restituisce una tupla: (read_stream, write_stream)
-        # Usiamo (read_stream, write_stream) per spacchettarli immediatamente.
-        async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
-            logger.info("[SSE] Sessione stabilita. Avvio gestione stream...")
-            
-            # 2. Usiamo il metodo REALE dell'SDK MCP: 'handle_connection'
-            # Passiamo i due stream separatamente come richiesto dall'interfaccia.
-            await server.handle_connection(read_stream, write_stream)
-            
-    except Exception as e:
-        # Logghiamo l'errore completo per debugging (incluso lo stack trace)
-        logger.error(f"[SSE] Errore durante la sessione SSE: {e}", exc_info=True)
-        raise
+    # Estraiamo tutti i metodi e attributi disponibili
+    metodi = dir(server)
+    
+    logger.info(f"[DIAGNOSIS] Metodi trovati ({len(metodi)}):")
+    for m in metodi:
+        logger.info(f"  -> {m}")
+        
+    return {"status": "ispezione completata", "metodi_trovati": len(metodi)}
 
 @app.post("/message")
 async def message_endpoint(request: Request):
