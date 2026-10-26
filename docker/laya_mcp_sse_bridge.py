@@ -1,7 +1,7 @@
 """
-Laya MCP SSE Bridge (Final Stability Version).
-Risolve il TypeError di Python passando gli argomenti in modo posizionale 
-per compatibilità con le firme 'positional-only' dell'SDK MCP.
+Laya MCP SSE Bridge (Ultra-Stable Version).
+Questa versione è progettata per essere "bulletproof" contro client che inviano 
+richieste malformate o fuori ordine, evitando crash ASGI.
 """
 
 import os
@@ -10,6 +10,7 @@ import sys
 from contextvars import ContextVar
 from typing import Any, Callable, Dict, Tuple
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from mcp.server.sse import SseServerTransport
 from laya.mcp.server import server
 
@@ -54,20 +55,13 @@ async def handle_sse_logic(scope, receive, send):
     try:
         async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
             logger.info("[SSE] Sessione stabilita. Avvio loop 'run'...")
-            
-            # Tentativo di ottenere l'oggetto di inizializzazione
             try:
                 from mcp.types import InitializationOptions
                 init_opts = InitializationOptions()
             except ImportError:
                 init_opts = None
-
-            # IL FIX DEFINITIVO: Chiamata posizionale.
-            # Non usiamo 'initialization_options=init_opts' perché l'SDK 
-            # probabilmente usa una firma positional-only.
-            # Passiamo i 3 argomenti in ordine: self, read, write, init_opts
+            # Chiamata posizionale per compatibilità SDK
             await server._lowlevel_server.run(read_stream, write_stream, init_opts)
-            
     except Exception as e:
         logger.error(f"[SSE] Errore durante la sessione SSE: {e}", exc_info=True)
         raise
@@ -75,15 +69,29 @@ async def handle_sse_logic(scope, receive, send):
 async def handle_message_logic(scope, receive, send):
     """Gestisce la ricezione dei messaggi POST."""
     query_params = scope.get("query_string", b"").decode()
-    if "session_id" not in query_params:
-        logger.warning(f"[POST] [CRITICO] Messaggio ricevuto SENZA session_id. Query: {query_params}")
     
+    # Se non c'è session_id, non tentare di processare, rispondi subito con 400.
+    if "session_id" not in query_params:
+        logger.warning(f"[POST] [REJECTED] Messaggio ricevuto SENZA session_id. Query: {query_params}")
+        # Usiamo una risposta diretta per evitare che FastAPI provochi un RuntimeError ASGI
+        response = JSONResponse(
+            status_code=400, 
+            content={"error": "missing_session_id", "message": "A session_id is required for all POST requests."}
+        )
+        await response(scope, receive, send)
+        return
+
     try:
         await transport.handle_post_message(scope, receive, send)
         logger.debug("[POST] Messaggio processato con successo.")
     except Exception as e:
         logger.error(f"[POST] Errore elaborazione messaggio: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Fallback sicuro per l'errore
+        response = JSONResponse(
+            status_code=500, 
+            content={"error": "internal_error", "message": str(e)}
+        )
+        await response(scope, receive, send)
 
 # --- ROUTING UNIVERSALE ---
 
@@ -96,7 +104,9 @@ async def sse_router(request: Request):
     if request.method == "GET":
         return await handle_sse_logic(scope, receive, send)
     else:
-        return await handle_message_logic(scope, receive, send)
+        # Per il POST, usiamo la logica dedicata che gestisce la risposta direttamente
+        await handle_message_logic(scope, receive, send)
+        return Response(status_code=200) # Placeholder
 
 @app.post("/mcp")
 @app.post("/message")
@@ -104,11 +114,12 @@ async def message_redirect(request: Request):
     scope = asgi_scope_var.get()
     receive = asgi_receive_var.get()
     send = asgi_send_var.get()
-    return await handle_message_logic(scope, receive, send)
+    await handle_message_logic(scope, receive, send)
+    return Response(status_code=200)
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "bridge": "universal_mode"}
+    return {"status": "ok", "bridge": "ultra_stable_mode"}
 
 if __name__ == "__main__":
     import uvicorn
