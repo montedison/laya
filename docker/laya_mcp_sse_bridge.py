@@ -1,28 +1,54 @@
-import asyncio
+"""
+Laya MCP SSE Bridge.
+
+This script acts as an HTTP/SSE adapter for the Laya MCP server. 
+It wraps the Laya MCP stdio server into a FastAPI application, 
+exposing it via Server-Sent Events (SSE).
+"""
+
+import os
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
-from laya.mcp.server import server  # Importiamo l'oggetto server di Laya
-from mcp.server.sse import SseServerTransport # Trasporto ufficiale MCP per SSE
+from mcp.server.sse import SseServerTransport
+from laya.mcp.server import server  # The actual Laya MCP server instance
 
-app = FastAPI()
-# Inizializziamo il trasporto SSE
-transport = SseServerTransport(app)
+# 1. Initialize FastAPI application
+app = FastAPI(title="Laya MCP SSE Bridge")
+
+# 2. Initialize the SSE transport
+# CRITICAL FIX: We pass the string endpoint "/sse", NOT the 'app' object.
+transport = SseServerTransport("/sse")
 
 @app.get("/sse")
 async def sse_endpoint(request: Request):
-    """Endpoint per la connessione SSE richiesta dai client MCP (come Unsloth)"""
+    """
+    SSE Endpoint.
+    Handles the initial connection from the MCP client. 
+    It establishes a session and hands it over to the Laya MCP server.
+    """
     async with transport.connect_sse(request.scope, request.receive, request.send) as session:
-        # Gestisce la sessione MCP usando l'oggetto server di Laya
+        # Link the transport session to the Laya MCP server logic
         await server.handle_session(session)
 
 @app.post("/message")
 async def message_endpoint(request: Request):
-    """Endpoint per ricevere i messaggi JSON-RPC dal client via POST"""
+    """
+    Message Endpoint.
+    Handles incoming JSON-RPC messages sent by the client via HTTP POST.
+    """
     await transport.handle_post_message(request)
 
+@app.get("/health")
+async def health_check():
+    """Health check for container orchestration."""
+    return {"status": "ok", "bridge": "laya-mcp-sse"}
+
 if __name__ == "__main__":
-    import os
+    # Load configuration from environment variables
     port = int(os.getenv("LAYA_MCP_PORT", 8001))
-    print(f"[BRIDGE] Avvio SSE Bridge su porta {port}...")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    host = os.getenv("LAYA_MCP_LISTEN", "0.0.0.0")
+    
+    print(f"[BRIDGE] Starting Laya MCP SSE Bridge on {host}:{port}")
+    print(f"[BRIDGE] SSE Endpoint: http://{host}:{port}/sse")
+    
+    uvicorn.run(app, host=host, port=port, log_level="info")
