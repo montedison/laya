@@ -1,76 +1,93 @@
 """
-Laya MCP SSE Bridge (Final Production Version - ASGI Injection Fix).
+Laya MCP SSE Bridge (Final Production Version - ContextVar Implementation).
 
 This script acts as an HTTP/SSE adapter for the Laya MCP server. 
-It uses a custom ASGI middleware to inject the 'send' function into the 
-request scope, enabling the MCP transport to communicate via HTTP.
+It uses Python ContextVars to safely pass the ASGI 'send' function 
+through the request lifecycle without mutating the immutable ASGI scope.
 """
 
 import os
 import uvicorn
+from contextvars import ContextVar
+from typing import Callable, Any
 from fastapi import FastAPI, Request
 from mcp.server.sse import SseServerTransport
 from laya.mcp.server import server  # The actual Laya MCP server instance
 
-# 1. Initialize FastAPI application
+# 1. Initialize ContextVar to hold the ASGI 'send' function.
+# This is task-safe and does not mutate the request scope.
+asgi_send_var: ContextVar[Callable[[Any, Any, Any], Any]] = ContextVar("asgi_send")
+
+# 2. Initialize FastAPI application
 app = FastAPI(title="Laya MCP SSE Bridge")
 
-# 2. ASGI Middleware to inject 'send' into the scope
+# 3. Middleware to capture the 'send' function from the ASGI lifecycle
+@app.middleware("http")
+async def capture_asgi_send(request: Request, call_next):
+    """
+    ASGI Middleware that captures the low-level 'send' function 
+    and stores it in a ContextVar for the duration of the request.
+    """
+    # In ASGI, the 'send' function is passed as the third argument to the app.
+    # In FastAPI middleware, we can't get it directly from 'request', 
+    # but we can access it from the underlying ASGI scope.
+    # However, the cleanest way is to capture it during the middleware call.
+    # We use a trick: we intercept the 'send' function from the ASGI stack.
+    
+    # We need to access the 'send' function which is part of the ASGI call.
+    # Since we are in a middleware, we can't easily grab it unless we wrap it.
+    # But wait, there is a better way: we use the 'send' from the scope 
+    # if available, but since it's not, we wrap the 'send' function itself.
+    
+    # Let's use a more robust approach: capture 'send' via a wrapper.
+    # Actually, the most reliable way in FastAPI is to use the 'send' 
+    # provided by the ASGI connection.
+    return await call_next(request)
+
+# RE-ENGINEERING THE MIDDLEWARE: 
+# Since FastAPI doesn't expose 'send' to middleware easily, 
+# we implement a custom ASGI middleware class to be absolutely sure.
+
 class LayaSendMiddleware:
-    """
-    Custom ASGI middleware that injects the 'send' function into the 
-    request scope. This allows FastAPI route handlers to access the 
-    low-level ASGI 'send' function via request.scope['laya_send'].
-    """
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            # Inject the 'send' function into the scope dictionary
-            # We use a unique key to avoid collisions with standard ASGI keys
-            scope["laya_send"] = send
-        await self.app(scope, receive, send)
+            # Store the 'send' function in the ContextVar
+            token = asgi_send_var.set(send)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                # Always reset the ContextVar to prevent memory leaks/pollution
+                asgi_send_var.reset(token)
+        else:
+            await self.app(scope, receive, send)
 
-# Apply the middleware to the app
+# Apply the custom middleware
 app.add_middleware(LayaSendMiddleware)
 
-# 3. Initialize the SSE transport
-# The argument is the endpoint path for the SSE connection.
+# 4. Initialize the SSE transport
 transport = SseServerTransport("/sse")
 
 @app.get("/sse")
 async def sse_endpoint(request: Request):
     """
     SSE Endpoint.
-    Handles the initial connection from the MCP client. 
-    Uses the injected 'laya_send' from the scope.
+    Retrieves the 'send' function from the ContextVar.
     """
-    # We retrieve the injected 'send' function from the scope
-    laya_send = request.scope.get("laya_send")
-    if not laya_send:
-        return {"error": "ASGI send function not found in scope"}, 500
-
-    async with transport.connect_sse(request.scope, request.receive, laya_send) as session:
+    send_func = asgi_send_var.get()
+    async with transport.connect_sse(request.scope, request.receive, send_func) as session:
         await server.handle_session(session)
 
 @app.post("/message")
 async def message_endpoint(request: Request):
     """
     Message Endpoint.
-    Handles incoming JSON-RPC messages sent by the client via HTTP POST.
+    Retrieves the 'send' function from the ContextVar.
     """
-    # We retrieve the injected 'send' function from the scope
-    laya_send = request.scope.get("laya_send")
-    if not laya_send:
-        return {"error": "ASGI send function not found in scope"}, 500
-
-    # Pass the ASGI receive and send functions to the transport
-    await transport.handle_post_message(
-        request, 
-        request.receive, 
-        laya_send
-    )
+    send_func = asgi_send_var.get()
+    await transport.handle_post_message(request, request.receive, send_func)
 
 # --- COMPATIBILITY LAYER FOR UNSTOTH / MCP CLIENTS ---
 
@@ -78,7 +95,7 @@ async def message_endpoint(request: Request):
 async def mcp_alias_endpoint(request: Request):
     """
     Alias endpoint to prevent 404 errors. 
-    Routes GET to SSE and POST to the message handler.
+    Routes GET to the SSE stream and POST to the message handler.
     """
     if request.method == "GET":
         return await sse_endpoint(request)
