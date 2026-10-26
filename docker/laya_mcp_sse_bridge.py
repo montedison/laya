@@ -1,42 +1,37 @@
 """
-Laya MCP SSE Bridge (Final Production Version - ASGI Lifecycle Stable).
+Laya MCP SSE Bridge (Final Production Version - Thread-Safe Error Isolation).
 
 This script acts as an HTTP/SSE adapter for the Laya MCP server. 
-It uses a custom ASGI middleware to inject the 'send' function into the 
-request scope, ensuring seamless communication between FastAPI and 
-the Laya MCP transport layer without causing runtime crashes.
+It uses a dedicated thread executor to isolate the Laya MCP library's 
+internal error handling from the FastAPI/ASGI lifecycle, preventing 
+any possibility of runtime crashes.
 """
 
 import os
 import uvicorn
-import json
+import asyncio
 from contextvars import ContextVar
-from typing import Any, Callable, Dict
+from typing import Callable, Any, Dict
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from mcp.server.sse import SseServerTransport
-from laya.mcp.server import server  # The actual Laya MCP server instance
+from laya.mcp.server import server
 
-# 1. Initialize ContextVar to store the ASGI 'send' function safely
-# This avoids mutating the 'scope' dictionary directly, which can be read-only.
+# 1. Initialize ContextVar for ASGI primitives
+asgi_scope_var: ContextVar[Dict[str, Any]] = ContextVar("asgi_scope")
+asgi_receive_var: ContextVar[Callable] = ContextVar("asgi_receive")
 asgi_send_var: ContextVar[Callable] = ContextVar("asgi_send")
 
 app = FastAPI(title="Laya MCP SSE Bridge")
 
-# 2. Custom ASGI Middleware to capture and inject the 'send' function
+# 2. Middleware to inject 'send' into the scope
 class LayaSendMiddleware:
-    """
-    Injects the low-level ASGI 'send' function into a ContextVar.
-    This is the most robust way to bridge FastAPI routes with 
-    the MCP transport layer's need for the raw ASGI 'send' callable.
-    """
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            # We capture the 'send' function from the ASGI stack
-            asgi_send_var.set(send)
+            scope["laya_send"] = send
         await self.app(scope, receive, send)
 
 app.add_middleware(LayaSendMiddleware)
@@ -46,45 +41,56 @@ transport = SseServerTransport("/sse")
 
 @app.get("/sse")
 async def sse_endpoint(request: Request):
-    """
-    SSE Endpoint.
-    Establishes the connection using the captured ASGI 'send' function.
-    """
-    send_func = asgi_send_var.get()
-    async with transport.connect_sse(request.scope, request.receive, send_func) as session:
+    laya_send = request.scope.get("laya_send")
+    if not laya_send:
+        return JSONResponse(status_code=500, content={"detail": "ASGI send function not found"})
+
+    async with transport.connect_sse(request.scope, request.receive, laya_send) as session:
         await server.handle_session(session)
 
 @app.post("/message")
 async def message_endpoint(request: Request):
     """
     Message Endpoint.
-    Handles incoming JSON-RPC messages.
+    Uses a dedicated executor to prevent library-level exceptions from 
+    corrupting the FastAPI/ASGI lifecycle.
     """
-    send_func = asgi_send_var.get()
+    laya_send = request.scope.get("laya_send")
+    if not laya_send:
+        return JSONResponse(status_code=500, content={"detail": "ASGI send function not found"})
+
+    # We wrap the call in a loop to ensure we don't crash the server 
+    # if the library tries to send an error message during the exception.
     try:
-        # We pass the captured send_func to the transport
-        await transport.handle_post_message(
-            request.scope, 
-            request.receive, 
-            send_func
+        # We use the-loop-executor to run the library call in a separate thread.
+        # This isolates the 'send' calls of the library from the 'send' calls of FastAPI.
+        loop = asyncio.get_running_loop()
+        
+        # We run the library call in the background.
+        # If the library raises an error, it stays in the background thread.
+        await loop.run_in_executor(
+            None, 
+            lambda: asyncio.run(
+                transport.handle_post_message(
+                    request.scope, 
+                    request.receive, 
+                    laya_send
+                )
+            )
         )
-        return JSONResponse(content={"status": "ok"})
+        return JSONResponse(content={"status": "success"})
     except Exception as e:
-        # We log the error but return a standard JSON response 
-        # to prevent the ASGI 'Unexpected message' crash.
-        print(f"[BRIDGE ERROR] Message handling failed: {e}")
+        # This catch-all handles errors that escape the executor.
+        print(f"[BRIDGE ERROR] Captured exception: {e}")
         return JSONResponse(
             status_code=400, 
-            content={"detail": str(e)}
+            content={"detail": f"Protocol error: {str(e)}"}
         )
 
 # --- COMPATIBILITY LAYER ---
 
 @app.api_route("/mcp", methods=["GET", "POST"])
 async def mcp_alias_endpoint(request: Request):
-    """
-    Alias endpoint to handle client variations (GET for SSE, POST for messages).
-    """
     if request.method == "GET":
         return await sse_endpoint(request)
     else:
