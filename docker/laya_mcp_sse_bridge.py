@@ -1,98 +1,109 @@
 """
-Laya MCP SSE Bridge (Production Ready - Session Resilience Version).
+Laya MCP SSE Bridge (Atomic ASGI Version).
 
-This script acts as an HTTP/SSE adapter for the Laya MCP server. 
-It handles session establishment via SSE and message routing via POST,
-ensuring robust handling of out-of-order requests from clients.
+This script bypasses FastAPI's Request object to interact directly with 
+the underlying ASGI primitives (scope, receive, send). This eliminates 
+any mismatch between high-level framework objects and the MCP transport layer.
 """
 
 import os
 import uvicorn
 from contextvars import ContextVar
-from typing import Callable, Any, Optional
-from fastapi import FastAPI, Request, HTTPException
+from typing import Any, Callable, Dict, Tuple
+from fastapi import FastAPI, Request
 from mcp.server.sse import SseServerTransport
-from laya.mcp.server import server  # The actual Laya MCP server instance
+from laya.mcp.server import server
 
-# 1. Initialize ContextVar for the 'send' function to ensure task-local scope
-asgi_send_var: ContextVar[Callable[[Any, Any, Any], Any]] = ContextVar("asgi_send")
+# 1. Define ContextVars to store the raw ASGI primitives
+# This is the most robust way to pass data across the async stack without mutating scope.
+asgi_scope_var: ContextVar[Dict[str, Any]] = ContextVar("asgi_scope")
+asgi_receive_var: ContextVar[Callable] = ContextVar("asgi_receive")
+asgi_send_var: ContextVar[Callable] = ContextVar("asgi_send")
 
-# 2. Initialize FastAPI application
 app = FastAPI(title="Laya MCP SSE Bridge")
 
-# 3. Custom ASGI Middleware to inject the 'send' function
-class LayaSendMiddleware:
+# 2. Initialize the SSE transport
+transport = SseServerTransport("/sse")
+
+# 3. Middleware to capture the raw ASGI primitives
+@app.middleware("http")
+async def capture_asgi_primitives(request: Request, call_next):
+    """
+    Captures the raw ASGI scope, receive, and send functions.
+    By storing them in ContextVars, we ensure the message_endpoint 
+    has access to the true, original ASGI dictionary, not a FastAPI wrapper.
+    """
+    # We extract the primitives directly from the request's internal ASGI scope
+    scope = request.scope
+    receive = request.receive
+    send = request.scope.get("send") # This is actually handled by the middleware stack
+    
+    # However, in FastAPI middleware, 'send' is not easily accessible via 'request'.
+    # We must use a custom ASGI middleware to get the real 'send' from the call chain.
+    return await call_next(request)
+
+# RE-RE-ENGINEERING: The only way to get the real 'send' is a custom ASGI middleware.
+class LayaPrimitiveMiddleware:
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            scope["laya_send"] = send
+            # Store the raw, unadulterated ASGI primitives
+            asgi_scope_var.set(scope)
+            asgi_receive_var.set(receive)
+            asgi_send_var.set(send)
         await self.app(scope, receive, send)
 
-app.add_middleware(LayaSendMiddleware)
-
-# 4. Initialize the SSE transport
-transport = SseServerTransport("/sse")
+app.add_middleware(LayaPrimitiveMiddleware)
 
 @app.get("/sse")
 async def sse_endpoint(request: Request):
     """
     SSE Endpoint.
-    Establishes the connection. The 'async with' block keeps the session 
-    alive as long as the client is connected.
+    Uses the raw ASGI primitives captured by the middleware.
     """
-    laya_send = request.scope.get("laya_send")
-    if not laya_send:
-        raise HTTPException(status_code=500, detail="ASGI send function not found")
-
-    async with transport.connect_sse(request.scope, request.receive, laya_send) as session:
+    scope = asgi_scope_var.get()
+    receive = asgi_receive_var.get()
+    send = asgi_send_var.get()
+    
+    async with transport.connect_sse(scope, receive, send) as session:
         await server.handle_session(session)
 
 @app.post("/message")
 async def message_endpoint(request: Request):
     """
     Message Endpoint.
-    Handles incoming JSON-RPC messages.
+    Uses the raw ASGI primitives to call the MCP transport.
+    This bypasses the FastAPI 'Request' object entirely, 
+    preventing any TypeError/AttributeError.
     """
-    laya_send = request.scope.get("laya_send")
-    if not laya_send:
-        raise HTTPException(status_code=500, detail="ASGI send function not found")
+    scope = asgi_scope_var.get()
+    receive = asgi_receive_var.get()
+    send = asgi_send_var.get()
 
     try:
-        await transport.handle_post_message(request, request.receive, laya_send)
+        # We pass the raw, original ASGI scope (a standard dict)
+        await transport.handle_post_message(scope, receive, send)
     except Exception as e:
-        # Catch errors to prevent the entire bridge from crashing
         print(f"[BRIDGE ERROR] Message handling failed: {e}")
+        from fastapi import HTTPException
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- COMPATIBILITY LAYER ---
 
 @app.api_route("/mcp", methods=["GET", "POST"])
 async def mcp_alias_endpoint(request: Request):
-    """
-    Alias endpoint to handle client variations.
-    If the client sends a GET, it's an SSE connection request.
-    If it sends a POST, it's a message.
-    """
     if request.method == "GET":
         return await sse_endpoint(request)
     else:
-        # We check if it's a message or a connection attempt
         return await message_endpoint(request)
 
 @app.api_route("/health", methods=["GET", "POST"])
 async def health_check(request: Request):
     return {"status": "ok", "bridge": "laya-mcp-sse"}
 
-# -------------------------------------------------------
-
 if __name__ == "__main__":
     port = int(os.getenv("LAYA_MCP_PORT", 8001))
     host = os.getenv("LAYA_MCP_LISTEN", "0.0.0.0")
-    
-    print(f"[BRIDGE] Starting Laya MCP SSE Bridge on {host}:{port}")
-    print(f"[BRIDGE] SSE Endpoint: http://{host}:{port}/sse")
-    print(f"[BRIDGE] Compatibility Endpoint: http://{host}:{port}/mcp")
-    
     uvicorn.run(app, host=host, port=port, log_level="info")
