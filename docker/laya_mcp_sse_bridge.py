@@ -1,106 +1,123 @@
 """
-Laya MCP SSE Bridge (Pure ASGI Implementation).
-
-This is the final, most robust version. It bypasses all web frameworks (FastAPI/Starlette)
-to interact directly with the ASGI specification. This eliminates all conflicts
-between framework-level abstractions and the low-level MCP transport layer.
+Laya MCP SSE Bridge (Diagnostic Version).
+Implementa un sistema di logging strutturato per risolvere i problemi di connessione dei client.
 """
 
 import os
-import json
-import asyncio
+import logging
+import sys
 import uvicorn
+from contextvars import ContextVar
+from typing import Any, Callable, Dict, Tuple
+from fastapi import FastAPI, Request, Response
 from mcp.server.sse import SseServerTransport
 from laya.mcp.server import server
 
-# 1. Initialize the SSE transport
+# --- CONFIGURAZIONE LOGGING PROFESSIONALE ---
+class DiagnosticFormatter(logging.Formatter):
+    """Formattatore per rendere i log leggibili e orientati all'analisi dei flussi."""
+    def format(self, record):
+        # Aggiunge un prefisso per distinguere i moduli
+        record.levelname_color = {
+            'DEBUG': '\033[36m',    # Cyan
+            'INFO': '\033[32m',    # Green
+            'WARNING': '\033[33m', # Yellow
+            'ERROR': '\033[31m',   # Red
+        }.get(record.levelname, '\033[0m')
+        
+        log_fmt = f"{record.levelname_color}%(levelname)s\033[0m | %(asctime)s | %(name)s | %(message)s"
+        return logging.Formatter(log_fmt, datefmt="%H:%M:%S").format(record)
+
+logger = logging.getLogger("LayaBridge")
+logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(DiagnosticFormatter())
+logger.addHandler(handler)
+
+# --- PRIMITIVE STORAGE ---
+asgi_scope_var: ContextVar[Dict[str, Any]] = ContextVar("asgi_scope")
+asgi_receive_var: ContextVar[Callable] = ContextVar("asgi_receive")
+asgi_send_var: ContextVar[Callable] = ContextVar("asgi_send")
+
+app = FastAPI(title="Laya MCP SSE Bridge")
+
+# 2. Initialize the SSE transport
 transport = SseServerTransport("/sse")
 
-async def handle_sse(scope, receive, send):
-    """Handles the SSE connection."""
-    async with transport.connect_sse(scope, receive, send) as session:
-        await server.handle_session(session)
+class LayaPrimitiveMiddleware:
+    def __init__(self, app):
+        self.app = app
 
-async def handle_post(scope, receive, send):
-    """Handles the POST message."""
-    # 1. Read the body from the ASGI receive channel
-    body = b""
-    more_body = True
-    while more_body:
-        message = await receive()
-        body += message.get("body", b"")
-        more_body = message.get("more_body", False)
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            asgi_scope_var.set(scope)
+            asgi_receive_var.set(receive)
+            asgi_send_var.set(send)
+            
+            # Log di ogni richiesta HTTP in entrata per debug immediato
+            method = scope.get("method")
+            path = scope.get("path")
+            query = scope.get("query", "")
+            logger.debug(f"[HTTP] {method} {path}?{query}")
+            
+        await self.app(scope, receive, send)
+
+app.add_middleware(LayaPrimitiveMiddleware)
+
+@app.get("/sse")
+async def sse_endpoint(request: Request):
+    """
+    SSE Endpoint con tracciamento della creazione sessione.
+    """
+    scope = asgi_scope_var.get()
+    receive = asgi_receive_var.get()
+    send = asgi_send_var.get()
+    
+    logger.info("[SSE] Tentativo di connessione in corso...")
+    
+    try:
+        async with transport.connect_sse(scope, receive, send) as session:
+            # Qui catturiamo l'ID sessione che la libreria MCP genera internamente
+            # Nota: l'estrazione dell'ID dipende da come mcp.py gestisce la sessione
+            logger.info(f"[SSE] Sessione stabilita con successo.")
+            await server.handle_session(session)
+    except Exception as e:
+        logger.error(f"[SSE] Errore durante la sessione SSE: {e}", exc_info=True)
+        raise
+
+@app.post("/message")
+async def message_endpoint(request: Request):
+    """
+    Message Endpoint con analisi granulare dei parametri di sessione.
+    """
+    scope = asgi_scope_var.get()
+    receive = asgi_receive_var.get()
+    send = asgi_send_var.get()
+
+    # ANALISI DEI PARAMETRI (Il cuore del debug)
+    query_params = scope.get("query_string", b"").decode()
+    session_id_found = "session_id" in query_params
+    
+    logger.info(f"[POST] Ricevuta richiesta su /message. SessionID presente: {session_id_found}")
+    if not session_id_found:
+        logger.warning(f"[POST] [CRITICO] Richiesta ricevuta SENZA session_id. Query string: {query_params}")
+    else:
+        logger.debug(f"[POST] Query string completa: {query_params}")
 
     try:
-        # 2. Parse the JSON-RPC command
-        command_json = body.decode("utf-8")
-        
-        # 3. Pass to the transport
-        # We pass the raw scope, receive, and send directly.
         await transport.handle_post_message(scope, receive, send)
-        
-        # Note: transport.handle_post_message in the mcp library 
-        # is designed to handle the response itself via the 'send' function.
-        # We don't need to send a manual response here.
-        
+        logger.debug("[POST] Messaggio processato correttamente.")
     except Exception as e:
-        print(f"[BRIDGE ERROR] POST handling failed: {e}")
-        # If the library fails to send its own error, we send a manual one
-        await send({
-            "type": "http.response.start",
-            "status": 400,
-            "headers": [(b"content-type", b"application/json")]
-        })
-        await send({
-            "type": "http.response.body",
-            "body": json.dumps({"detail": str(e)}).encode("utf-8")
-        })
+        logger.error(f"[POST] Errore durante l'elaborazione del messaggio: {e}")
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
 
-async def app(scope, receive, send):
-    """
-    The Pure ASGI Application.
-    Directly handles routing and protocol logic.
-    """
-    if scope["type"] != "http":
-        return
-
-    path = scope.get("path", "")
-    method = scope.get("method", "")
-
-    # --- ROUTING ---
-
-    if path == "/sse" and method == "GET":
-        await handle_sse(scope, receive, send)
-
-    elif (path == "/message" or path == "/mcp") and method == "POST":
-        await handle_post(scope, receive, send)
-
-    elif path == "/health":
-        # Handle health check
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [(b"content-type", b"application/json")]
-        })
-        await send({
-            "type": "http.response.body",
-            "body": b'{"status": "ok", "bridge": "laya-mcp-pure-asgi"}'
-        })
-
-    else:
-        # 404 Not Found
-        await send({
-            "type": "http.response.start",
-            "status": 404,
-            "headers": [(b"content-type", b"application/json")]
-        })
-        await send({
-            "type": "http.response.body",
-            "body": b'{"detail": "Not Found"}'
-        })
+# Endpoint di salute per test rapidi
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "bridge": "active"}
 
 if __name__ == "__main__":
-    port = int(os.getenv("LAYA_MCP_PORT", 8001))
-    host = os.getenv("LAYA_MCP_LISTEN", "0.0.0.0")
-    print(f"[BRIDGE] Starting Laya MCP Pure ASGI Server on {host}:{port}")
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    # Usiamo uvicorn direttamente per avere controllo totale
+    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="error") 
+    # Nota: log_level="error" per uvicorn perché vogliamo solo i nostri log colorati e puliti
