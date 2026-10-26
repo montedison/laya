@@ -67,7 +67,8 @@ app.add_middleware(LayaPrimitiveMiddleware)
 @app.get("/sse")
 async def sse_endpoint(request: Request):
     """
-    SSE Endpoint con tracciamento della creazione sessione.
+    SSE Endpoint Corretto.
+    Utilizza il metodo 'handle_connection' dell'SDK MCP e spacchetta correttamente i flussi.
     """
     scope = asgi_scope_var.get()
     receive = asgi_receive_var.get()
@@ -76,12 +77,17 @@ async def sse_endpoint(request: Request):
     logger.info("[SSE] Tentativo di connessione in corso...")
     
     try:
-        async with transport.connect_sse(scope, receive, send) as session:
-            # Qui catturiamo l'ID sessione che la libreria MCP genera internamente
-            # Nota: l'estrazione dell'ID dipende da come mcp.py gestisce la sessione
-            logger.info(f"[SSE] Sessione stabilita con successo.")
-            await server.handle_session(session)
+        # 1. Il context manager 'connect_sse' restituisce una tupla: (read_stream, write_stream)
+        # Usiamo (read_stream, write_stream) per spacchettarli immediatamente.
+        async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
+            logger.info("[SSE] Sessione stabilita. Avvio gestione stream...")
+            
+            # 2. Usiamo il metodo REALE dell'SDK MCP: 'handle_connection'
+            # Passiamo i due stream separatamente come richiesto dall'interfaccia.
+            await server.handle_connection(read_stream, write_stream)
+            
     except Exception as e:
+        # Logghiamo l'errore completo per debugging (incluso lo stack trace)
         logger.error(f"[SSE] Errore durante la sessione SSE: {e}", exc_info=True)
         raise
 
