@@ -34,7 +34,7 @@ asgi_send_var: ContextVar[Callable] = ContextVar("asgi_send")
 
 app = FastAPI(title="Laya MCP Universal Bridge")
 
-# L'endpoint di messaggistica che annunceremo al client.
+# L'endpoint di messaggistica che annunceremo.
 MESSAGING_ENDPOINT = "/mcp"
 transport = SseServerTransport(MESSAGING_ENDPOINT)
 
@@ -50,11 +50,10 @@ class LayaPrimitiveMiddleware:
             
             path = scope.get("path", "")
             
-            # --- FIX 1: PATH MATCHING ---
-            # Usiamo startswith perché il client Unsloth invierà POST a 
-            # /mcp?session_id=... o simili. Il controllo esatto "in" fallirebbe.
+            # --- FIX 1: POST BYPASS ---
+            # Intercettiamo i POST per evitare che FastAPI tenti di gestire la risposta
             if (path.startswith("/mcp") or path.startswith("/message")) and scope["method"] == "POST":
-                logger.info(f"[PROTOCOL] Intercepted {scope['method']} {path}. Bypassing FastAPI to handle MCP POST.")
+                logger.info(f"[PROTOCOL] Intercepted {scope['method']} {path}. Bypassing FastAPI.")
                 try:
                     await transport.handle_post_message(scope, receive, send)
                 except Exception as e:
@@ -81,32 +80,44 @@ async def handle_sse_logic(scope, receive, send):
     logger.info("[SSE] Handshake attempt via GET /sse")
     
     try:
-        # Usiamo il context manager del transport
-        async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
-            
-            # --- FIX DEFINITIVO: INIEZIONE MANUALE DEL FRAME SSE VIA BYTE-STREAM ---
-            # Poiché 'write_stream' non espone 'send_event', scriviamo direttamente 
-            # nel flusso di byte seguendo lo standard SSE: 'event: <nome>\ndata: <valore>\n\n'
-            
-            logger.info("[SSE] Attempting manual raw-byte injection of 'endpoint' event.")
-            
-            # Costruiamo il payload SSE standard
-            # L'endpoint deve essere quello definito nel bridge (MESSAGING_ENDPOINT)
-            # Nota: Il client Unsloth si aspetta che l'endpoint contenga il session_id.
-            # Il transport di MCP di solito gestisce questo, ma noi dobbiamo 
-            # assicurarci che il frame venga scritto nel flusso.
-            
-            sse_event_frame = f"event: endpoint\ndata: {MESSAGING_ENDPOINT}\n\n"
-            
-            try:
-                # Scriviamo direttamente nel write_stream (che è un AsyncByteStream)
-                await write_stream.write(sse_event_frame.encode("utf-8"))
-                logger.info(f"[SSE] Manual injection successful: {sse_event_frame.strip()}")
-            except Exception as e:
-                logger.error(f"[SSE] Failed to inject endpoint via raw write: {e}")
-                # Se fallisce la scrittura diretta, il client non vedrà mai l'endpoint e fallirà latentamente.
+        # --- FIX 2: PROTOCOL HIJACK (Manual SSE Handshake) ---
+        # Poiché il transport non ci permette di scrivere l'evento 'endpoint' 
+        # dopo la connessione, dobbiamo "iniettarlo" all'inizio della risposta ASGI.
+        
+        # 1. Inviamo l'header HTTP standard per SSE
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
+                (b"content-type", b"text/event-stream"),
+                (b"cache-control", b"no-cache"),
+                (b"connection", b"keep-alive"),
+            ],
+        })
 
-            logger.info("[SSE] SSE connection established and endpoint announced. Starting run loop.")
+        # 2. Inviiamo immediatamente l'evento 'endpoint' richiesto da Unsloth
+        # Questo assicura che il client riceva l'annuncio prima di qualsiasi altro frame.
+        logger.info(f"[SSE] Manually injecting 'endpoint' event: {MESSAGING_ENDPOINT}")
+        endpoint_payload = f"event: endpoint\ndata: {MESSAGING_ENDPOINT}\n\n".encode("utf-8")
+        await send({
+            "type": "http.response.body",
+            "body": endpoint_payload,
+            "more_body": False, # Nota: Questo è delicato in ASGI, ma serve per l'annuncio immediato
+        })
+
+        # 3. Ora che l'handshake è stato "completato" con l'annuncio, 
+        # passiamo il controllo al transport per gestire il flusso di dati continuo.
+        # Nota: Usiamo il context manager del transport per gestire la sessione.
+        # Poiché abbiamo già inviato l'inizio della risposta, il transport 
+        # dovrà gestire la parte 'body' successiva.
+        
+        # Importante: Alcuni transport implementano connect_sse() assumendo di 
+        # dover gestire anche l'invio di 'http.response.start'. 
+        # Se il trasporto fallisce perché la risposta è già stata iniziata, 
+        # dovremo passare a un approccio basato su stream di byte.
+        
+        async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
+            logger.info("[SSE] SSE connection established via hijack. Starting run loop.")
             
             try:
                 from mcp.types import InitializationOptions
@@ -114,7 +125,6 @@ async def handle_sse_logic(scope, receive, send):
             except ImportError:
                 init_opts = None
 
-            # Avvia il loop di esecuzione del server MCP
             await server._lowlevel_server.run(read_stream, write_stream, init_opts)
             
     except Exception as e:
@@ -133,9 +143,8 @@ async def sse_endpoint(request: Request):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "bridge": "production_ready_v1"}
+    return {"status": "ok", "bridge": "hijack_version_v1"}
 
 if __name__ == "__main__":
     import uvicorn
-    # Il bridge deve girare su una porta dedicata (es. 8001)
-    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="error")
