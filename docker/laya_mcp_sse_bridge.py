@@ -34,10 +34,15 @@ asgi_send_var: ContextVar[Callable] = ContextVar("asgi_send")
 
 app = FastAPI(title="Laya MCP Universal Bridge")
 
+# L'endpoint di messaggistica che annunceremo.
 MESSAGING_ENDPOINT = "/mcp"
 transport = SseServerTransport(MESSAGING_ENDPOINT)
 
 class LayaPrimitiveMiddleware:
+    """
+    Middleware per gestire il bypass dei messaggi POST e preservare 
+    il contesto ASGI per le chiamate MCP.
+    """
     def __init__(self, app):
         self.app = app
 
@@ -49,7 +54,9 @@ class LayaPrimitiveMiddleware:
             
             path = scope.get("path", "")
             
-            # POST BYPASS: Intercettiamo i POST per evitare conflitti con FastAPI
+            # --- FIX: POST BYPASS ---
+            # Intercettiamo i POST per evitare che FastAPI tenti di gestire la risposta.
+            # Questo assicura che il transport gestisca direttamente i messaggi in arrivo.
             if (path.startswith("/mcp") or path.startswith("/message")) and scope["method"] == "POST":
                 logger.info(f"[PROTOCOL] Intercepted {scope['method']} {path}. Bypassing FastAPI.")
                 try:
@@ -74,29 +81,47 @@ app.add_middleware(LayaPrimitiveMiddleware)
 # --- CORE LOGIC ---
 
 async def handle_sse_logic(scope, receive, send):
-    """Handles the GET /sse handshake and the long-running SSE stream."""
+    """
+    Gestisce l'handshake GET /sse e il flusso SSE a lungo termine.
+    Utilizza la tecnica 'Wrapped Send Injection' per iniettare l'evento 
+    'endpoint' immediatamente dopo l'handshake del transport senza violare ASGI.
+    """
     logger.info("[SSE] Handshake attempt via GET /sse")
     
-    try:
-        # 1. LASCIAMO CHE IL TRANSPORT GESTISCA L'HANDSHAKE HTTP (headers + start)
-        # Questo evita il RuntimeError: Unexpected ASGI message 'http.response.start'
-        async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
-            
-            # 2. INIEZIONE DELL'EVENTO 'ENDPOINT' VIA PRIMITIVA ASGI
-            # Invece di usare write_stream.write (che fallisce con AttributeError),
-            # usiamo la funzione 'send' originale. Inviando un messaggio di tipo 
-            # 'http.response.body' con 'more_body=True', iniettiamo il frame SSE 
-            # senza chiudere la connessione.
-            logger.info(f"[SSE] Injecting 'endpoint' event via raw ASGI send.")
-            endpoint_payload = f"event: endpoint\ndata: {MESSAGING_ENDPOINT}\n\n".encode("utf-8")
-            
-            await send({
-                "type": "http.response.body",
-                "body": endpoint_payload,
-                "more_body": True, # Fondamentale per non terminare la risposta
-            })
+    # Variabile di stato per garantire che l'iniezione avvenga una sola volta
+    endpoint_sent = False
 
-            logger.info("[SSE] SSE connection established. Starting run loop.")
+    async def wrapped_send(message):
+        """
+        Wrapper della funzione 'send' ASGI per intercettare l'inizio della risposta
+        e iniettare il payload richiesto dal client (Unsloth).
+        """
+        nonlocal endpoint_sent
+        
+        # Se il transport sta inviando l'inizio della risposta (http.response.start)
+        if message["type"] == "http.response.start":
+            # 1. Lasciamo che il transport invii il suo 'start' originale (evita crash)
+            await send(message)
+            
+            # 2. SUBITO DOPO lo start, iniettiamo il frame SSE 'endpoint'
+            if not endpoint_sent:
+                logger.info(f"[SSE] Injecting 'endpoint' event immediately after transport START.")
+                endpoint_payload = f"event: endpoint\ndata: {MESSAGING_ENDPOINT}\n\n".encode("utf-8")
+                
+                await send({
+                    "type": "http.response.body",
+                    "body": endpoint_payload,
+                    "more_body": True, # Fondamentale: indica che la risposta continua
+                })
+                endpoint_sent = True
+        else:
+            # Per tutti gli altri messaggi (body, ecc.), passiamo semplicemente al send originale
+            await send(message)
+
+    try:
+        # Utilizziamo wrapped_send invece del send originale per "agganciarci" al ciclo di vita
+        async with transport.connect_sse(scope, receive, wrapped_send) as (read_stream, write_stream):
+            logger.info("[SSE] SSE connection established via wrapped_send. Starting run loop.")
             
             try:
                 from mcp.types import InitializationOptions
@@ -104,7 +129,7 @@ async def handle_sse_logic(scope, receive, send):
             except ImportError:
                 init_opts = None
 
-            # 3. AVVIO DEL SERVER MCP
+            # Avvio del server MCP a basso livello
             await server._lowlevel_server.run(read_stream, write_stream, init_opts)
             
     except Exception as e:
@@ -115,6 +140,7 @@ async def handle_sse_logic(scope, receive, send):
 
 @app.get("/sse")
 async def sse_endpoint(request: Request):
+    """Endpoint per l'handshake SSE."""
     scope = asgi_scope_var.get()
     receive = asgi_receive_var.get()
     send = asgi_send_var.get()
@@ -122,8 +148,9 @@ async def sse_endpoint(request: Request):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "bridge": "elegant_injection_v2"}
+    """Endpoint di monitoraggio."""
+    return {"status": "ok", "bridge": "elegant_injection_v3"}
 
 if __name__ == "__main__":
-    import uvicorn
+    # Esecuzione con Uvicorn su porta dedicata
     uvicorn.run(app, host="0.0.0.0", port=8001, log_level="error")
