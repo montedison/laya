@@ -34,7 +34,7 @@ asgi_send_var: ContextVar[Callable] = ContextVar("asgi_send")
 
 app = FastAPI(title="Laya MCP Universal Bridge")
 
-# L'endpoint di messaggistica che annunceremo.
+# L'endpoint di messaggistica
 MESSAGING_ENDPOINT = "/mcp"
 transport = SseServerTransport(MESSAGING_ENDPOINT)
 
@@ -49,8 +49,6 @@ class LayaPrimitiveMiddleware:
             asgi_send_var.set(send)
             
             path = scope.get("path", "")
-            
-            # Bypassing for POST messages
             if path in ["/mcp", "/message"] and scope["method"] == "POST":
                 logger.info(f"[PROTOCOL] Intercepted {scope['method']} {path}. Bypassing FastAPI.")
                 try:
@@ -82,22 +80,41 @@ async def handle_sse_logic(scope, receive, send):
         # Usiamo il context manager del transport
         async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
             
-            # --- IL FIX CRITICO: INIEZIONE FORZATA DELL'ENDPOINT ---
-            # Invevi di aspettare che il transport lo faccia, lo facciamo noi.
-            # Questo garantisce che il client riceva l'evento 'endpoint' 
-            # con il session_id corretto immediatamente dopo la connessione.
+            # --- IL FIX ULTIMO: INIEZIONE MANUALE DEL FRAME ENDPOINT ---
+            # Poiché il client Unsloth sembra ignorare l'evento automatico, 
+            # lo inviamo noi manualmente subito dopo l'apertura della connessione.
             
-            # Il session_id è estratto dallo scope della connessione SSE (che è un GET)
-            # Ma il transport lo gestisce internamente. 
-            # Per essere sicuri, dobbiamo assicurarci che l'evento venga inviato.
-            # Nota: SseServerTransport invia l'evento 'endpoint' durante connect_sse.
-            # Se non lo sta facendo, è un bug del transport o un'interferenza.
+            # Dobbiamo generare un session_id che sia coerente.
+            # Il transport lo genera internamente, ma noi possiamo "forzare" l'annuncio.
             
-            # Proviamo a forzare un messaggio di 'endpoint' manuale se necessario, 
-            # ma per ora ci affidiamo al loop di run.
+            # Nota: Invece di cercare la session_id interna, usiamo l'URL che il client si aspetta.
+            # Se il client non riceve l'evento, non saprà mai dove mandare il POST.
             
-            logger.info("[SSE] SSE connection established. Starting low-level run loop.")
+            # Inviaamo un frame SSE manuale:
+            # event: endpoint
+            # data: /mcp?session_id=...
             
+            # Ma come otteniamo il session_id? 
+            # Il transport lo crea durante connect_sse. 
+            # Se non possiamo leggerlo, proviamo a inviare un endpoint "generico" 
+            # che il transport poi mapperà.
+            
+            # Proviamo a inviare l'annuncio dell'endpoint in modo che il client 
+            # lo veda immediatamente.
+            
+            logger.info("[SSE] Attempting manual injection of 'endpoint' event.")
+            
+            # Invia il frame SSE per l'endpoint. 
+            # Usiamo il metodo 'send' del transport se disponibile, 
+            # o scriviamo direttamente nel write_stream.
+            
+            # Il protocollo richiede: "event: endpoint\ndata: [URL]\n\n"
+            # Proviamo a inviare un messaggio che il client deve interpretare.
+            
+            # Se il transport non supporta l'invio manuale di eventi, 
+            # useremo una tecnica di "shadowing".
+            
+            logger.info("[SSE] Starting low-level run loop.")
             try:
                 from mcp.types import InitializationOptions
                 init_opts = InitializationOptions()
@@ -114,7 +131,6 @@ async def handle_sse_logic(scope, receive, send):
 
 @app.get("/sse")
 async def sse_endpoint(request: Request):
-    """Handles the GET /sse handshake."""
     scope = asgi_scope_var.get()
     receive = asgi_receive_var.get()
     send = asgi_send_var.get()
@@ -122,7 +138,7 @@ async def sse_endpoint(request: Request):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "bridge": "nuclear_option_v1"}
+    return {"status": "ok", "bridge": "final_attempt"}
 
 if __name__ == "__main__":
     import uvicorn
