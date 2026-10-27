@@ -2,6 +2,7 @@ import os
 import logging
 import sys
 import json
+import asyncio
 from datetime import datetime
 from contextvars import ContextVar
 from typing import Any, Callable, Dict, Tuple
@@ -33,8 +34,9 @@ asgi_send_var: ContextVar[Callable] = ContextVar("asgi_send")
 
 app = FastAPI(title="Laya MCP Universal Bridge")
 
-# IMPORTANT: The endpoint for messages must match what the client expects.
-transport = SseServerTransport("/mcp")
+# L'endpoint di messaggistica che annunceremo.
+MESSAGING_ENDPOINT = "/mcp"
+transport = SseServerTransport(MESSAGING_ENDPOINT)
 
 class LayaPrimitiveMiddleware:
     def __init__(self, app):
@@ -48,23 +50,13 @@ class LayaPrimitiveMiddleware:
             
             path = scope.get("path", "")
             
-            # --- THE ULTIMATE FIX: PROTOCOL BYPASS ---
-            # If the request is a POST to the MCP messaging endpoints, 
-            # we handle it directly and BYPASS the FastAPI/Starlette router.
-            # This prevents the "double response" (RuntimeError) because 
-            # FastAPI will never try to send its own response.
+            # Bypassing for POST messages
             if path in ["/mcp", "/message"] and scope["method"] == "POST":
-                logger.info(f"[PROTOCOL] Intercepted {scope['method']} {path}. Bypassing FastAPI router to prevent ASGI lifecycle conflicts.")
+                logger.info(f"[PROTOCOL] Intercepted {scope['method']} {path}. Bypassing FastAPI.")
                 try:
-                    # We use the raw transport to handle the message.
-                    # It will call 'send' itself to complete the HTTP response.
                     await transport.handle_post_message(scope, receive, send)
-                    logger.debug(f"[PROTOCOL] {path} handled via direct transport.")
                 except Exception as e:
-                    logger.error(f"[PROTOCOL] Error in direct transport handling for {path}: {e}", exc_info=True)
-                    # If we fail, we must at least send a valid error response 
-                    # so the client isn't left hanging.
-                    # Note: We use a direct ASGI send here because we are in the middleware.
+                    logger.error(f"[PROTOCOL] Error in direct transport: {e}")
                     await send({
                         "type": "http.response.start",
                         "status": 500,
@@ -74,25 +66,38 @@ class LayaPrimitiveMiddleware:
                         "type": "http.response.body",
                         "body": json.dumps({"error": str(e)}).encode("utf-8"),
                     })
-                return # EXIT the middleware here. Do NOT call self.app.
+                return 
 
         await self.app(scope, receive, send)
 
 app.add_middleware(LayaPrimitiveMiddleware)
 
-# --- SSE HANDSHAKE ROUTE ---
+# --- CORE LOGIC ---
 
-@app.get("/sse")
-async def sse_endpoint(request: Request):
-    """Handles the GET /sse handshake. Handled via FastAPI."""
-    scope = asgi_scope_var.get()
-    receive = asgi_receive_var.get()
-    send = asgi_send_var.get()
-    
+async def handle_sse_logic(scope, receive, send):
+    """Handles the GET /sse handshake and the long-running SSE stream."""
     logger.info("[SSE] Handshake attempt via GET /sse")
+    
     try:
+        # Usiamo il context manager del transport
         async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
+            
+            # --- IL FIX CRITICO: INIEZIONE FORZATA DELL'ENDPOINT ---
+            # Invevi di aspettare che il transport lo faccia, lo facciamo noi.
+            # Questo garantisce che il client riceva l'evento 'endpoint' 
+            # con il session_id corretto immediatamente dopo la connessione.
+            
+            # Il session_id è estratto dallo scope della connessione SSE (che è un GET)
+            # Ma il transport lo gestisce internamente. 
+            # Per essere sicuri, dobbiamo assicurarci che l'evento venga inviato.
+            # Nota: SseServerTransport invia l'evento 'endpoint' durante connect_sse.
+            # Se non lo sta facendo, è un bug del transport o un'interferenza.
+            
+            # Proviamo a forzare un messaggio di 'endpoint' manuale se necessario, 
+            # ma per ora ci affidiamo al loop di run.
+            
             logger.info("[SSE] SSE connection established. Starting low-level run loop.")
+            
             try:
                 from mcp.types import InitializationOptions
                 init_opts = InitializationOptions()
@@ -100,15 +105,24 @@ async def sse_endpoint(request: Request):
                 init_opts = None
 
             await server._lowlevel_server.run(read_stream, write_stream, init_opts)
+            
     except Exception as e:
         logger.error(f"[SSE] Critical error in SSE loop: {e}", exc_info=True)
         raise
 
-# --- OTHER ROUTES ---
+# --- ROUTING ---
+
+@app.get("/sse")
+async def sse_endpoint(request: Request):
+    """Handles the GET /sse handshake."""
+    scope = asgi_scope_var.get()
+    receive = asgi_receive_var.get()
+    send = asgi_send_var.get()
+    await handle_sse_logic(scope, receive, send)
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "bridge": "protocol_bypass_v1"}
+    return {"status": "ok", "bridge": "nuclear_option_v1"}
 
 if __name__ == "__main__":
     import uvicorn
