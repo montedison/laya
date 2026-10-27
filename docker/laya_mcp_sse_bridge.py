@@ -34,7 +34,7 @@ asgi_send_var: ContextVar[Callable] = ContextVar("asgi_send")
 
 app = FastAPI(title="Laya MCP Universal Bridge")
 
-# L'endpoint di messaggistica che annunceremo.
+# L'endpoint di messaggistica che annunceremo al client.
 MESSAGING_ENDPOINT = "/mcp"
 transport = SseServerTransport(MESSAGING_ENDPOINT)
 
@@ -50,9 +50,11 @@ class LayaPrimitiveMiddleware:
             
             path = scope.get("path", "")
             
-            # Bypassing for POST messages
-            if path in ["/mcp", "/message"] and scope["method"] == "POST":
-                logger.info(f"[PROTOCOL] Intercepted {scope['method']} {path}. Bypassing FastAPI.")
+            # --- FIX 1: PATH MATCHING ---
+            # Usiamo startswith perché il client Unsloth invierà POST a 
+            # /mcp?session_id=... o simili. Il controllo esatto "in" fallirebbe.
+            if (path.startswith("/mcp") or path.startswith("/message")) and scope["method"] == "POST":
+                logger.info(f"[PROTOCOL] Intercepted {scope['method']} {path}. Bypassing FastAPI to handle MCP POST.")
                 try:
                     await transport.handle_post_message(scope, receive, send)
                 except Exception as e:
@@ -79,24 +81,26 @@ async def handle_sse_logic(scope, receive, send):
     logger.info("[SSE] Handshake attempt via GET /sse")
     
     try:
-        # Usiamo il context manager del transport
+        # Usiamo il context manager del transport per gestire la connessione
         async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
             
-            # --- IL FIX CRITICO: INIEZIONE FORZATA DELL'ENDPOINT ---
-            # Invevi di aspettare che il transport lo faccia, lo facciamo noi.
-            # Questo garantisce che il client riceva l'evento 'endpoint' 
-            # con il session_id corretto immediatamente dopo la connessione.
+            # --- FIX 2: PROACTIVE ENDPOINT INJECTION ---
+            # Il client Unsloth è estremamente rigoroso: deve ricevere l'evento 'endpoint'
+            # immediatamente dopo l'apertura della connessione SSE per sapere dove 
+            # inviare le chiamate POST (e sincronizzare il session_id).
+            # Se non lo inviamo noi manualmente, il client potrebbe non vederlo 
+            # a causa della gestione interna del trasporto e fallire l'handshake.
             
-            # Il session_id è estratto dallo scope della connessione SSE (che è un GET)
-            # Ma il transport lo gestisce internamente. 
-            # Per essere sicuri, dobbiamo assicurarci che l'evento venga inviato.
-            # Nota: SseServerTransport invia l'evento 'endpoint' durante connect_sse.
-            # Se non lo sta facendo, è un bug del transport o un'interferenza.
-            
-            # Proviamo a forzare un messaggio di 'endpoint' manuale se necessario, 
-            # ma per ora ci affidiamo al loop di run.
-            
-            logger.info("[SSE] SSE connection established. Starting low-level run loop.")
+            logger.info(f"[SSE] Injecting mandatory 'endpoint' event: {MESSAGING_ENDPOINT}")
+            try:
+                # Inviando l'evento 'endpoint' con l'URL del MESSAGING_ENDPOINT, 
+                # diciamo al client: "Ora puoi inviarmi i messaggi a questo indirizzo".
+                await write_stream.send_event("endpoint", MESSAGING_ENDPOINT)
+            except Exception as e:
+                logger.error(f"[SSE] Failed to inject endpoint event: {e}")
+                # Non interrompiamo il loop se l'invio fallisce, ma logghiamo l'errore.
+
+            logger.info("[SSE] SSE connection established and endpoint announced. Starting run loop.")
             
             try:
                 from mcp.types import InitializationOptions
@@ -104,6 +108,7 @@ async def handle_sse_logic(scope, receive, send):
             except ImportError:
                 init_opts = None
 
+            # Avvia il loop di esecuzione del server MCP (gestione messaggi in entrata)
             await server._lowlevel_server.run(read_stream, write_stream, init_opts)
             
     except Exception as e:
@@ -122,8 +127,9 @@ async def sse_endpoint(request: Request):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "bridge": "nuclear_option_v1"}
+    return {"status": "ok", "bridge": "production_ready_v1"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="error")
+    # Il bridge deve girare su una porta dedicata (es. 8001)
+    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
