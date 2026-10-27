@@ -81,24 +81,30 @@ async def handle_sse_logic(scope, receive, send):
     logger.info("[SSE] Handshake attempt via GET /sse")
     
     try:
-        # Usiamo il context manager del transport per gestire la connessione
+        # Usiamo il context manager del transport
         async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
             
-            # --- FIX 2: PROACTIVE ENDPOINT INJECTION ---
-            # Il client Unsloth è estremamente rigoroso: deve ricevere l'evento 'endpoint'
-            # immediatamente dopo l'apertura della connessione SSE per sapere dove 
-            # inviare le chiamate POST (e sincronizzare il session_id).
-            # Se non lo inviamo noi manualmente, il client potrebbe non vederlo 
-            # a causa della gestione interna del trasporto e fallire l'handshake.
+            # --- FIX DEFINITIVO: INIEZIONE MANUALE DEL FRAME SSE VIA BYTE-STREAM ---
+            # Poiché 'write_stream' non espone 'send_event', scriviamo direttamente 
+            # nel flusso di byte seguendo lo standard SSE: 'event: <nome>\ndata: <valore>\n\n'
             
-            logger.info(f"[SSE] Injecting mandatory 'endpoint' event: {MESSAGING_ENDPOINT}")
+            logger.info("[SSE] Attempting manual raw-byte injection of 'endpoint' event.")
+            
+            # Costruiamo il payload SSE standard
+            # L'endpoint deve essere quello definito nel bridge (MESSAGING_ENDPOINT)
+            # Nota: Il client Unsloth si aspetta che l'endpoint contenga il session_id.
+            # Il transport di MCP di solito gestisce questo, ma noi dobbiamo 
+            # assicurarci che il frame venga scritto nel flusso.
+            
+            sse_event_frame = f"event: endpoint\ndata: {MESSAGING_ENDPOINT}\n\n"
+            
             try:
-                # Inviando l'evento 'endpoint' con l'URL del MESSAGING_ENDPOINT, 
-                # diciamo al client: "Ora puoi inviarmi i messaggi a questo indirizzo".
-                await write_stream.send_event("endpoint", MESSAGING_ENDPOINT)
+                # Scriviamo direttamente nel write_stream (che è un AsyncByteStream)
+                await write_stream.write(sse_event_frame.encode("utf-8"))
+                logger.info(f"[SSE] Manual injection successful: {sse_event_frame.strip()}")
             except Exception as e:
-                logger.error(f"[SSE] Failed to inject endpoint event: {e}")
-                # Non interrompiamo il loop se l'invio fallisce, ma logghiamo l'errore.
+                logger.error(f"[SSE] Failed to inject endpoint via raw write: {e}")
+                # Se fallisce la scrittura diretta, il client non vedrà mai l'endpoint e fallirà latentamente.
 
             logger.info("[SSE] SSE connection established and endpoint announced. Starting run loop.")
             
@@ -108,7 +114,7 @@ async def handle_sse_logic(scope, receive, send):
             except ImportError:
                 init_opts = None
 
-            # Avvia il loop di esecuzione del server MCP (gestione messaggi in entrata)
+            # Avvia il loop di esecuzione del server MCP
             await server._lowlevel_server.run(read_stream, write_stream, init_opts)
             
     except Exception as e:
