@@ -71,55 +71,34 @@ class LayaPrimitiveMiddleware:
 app.add_middleware(LayaPrimitiveMiddleware)
 
 # --- CORE LOGIC ---
-
 async def handle_sse_logic(scope, receive, send):
-    """Handles the GET /sse handshake and the long-running SSE stream."""
     logger.info("[SSE] Handshake attempt via GET /sse")
-    
     try:
-        # Usiamo il context manager del transport
         async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
             
-            # --- IL FIX ULTIMO: INIEZIONE MANUALE DEL FRAME ENDPOINT ---
-            # Poiché il client Unsloth sembra ignorare l'evento automatico, 
-            # lo inviamo noi manualmente subito dopo l'apertura della connessione.
+            # --- INIEZIONE MANUALE DEL FRAME SSE ENDPOINT ---
+            # Questa è la "Nuclear Option". Inveviaamo il frame SSE che annuncia l'endpoint.
+            # Il client Unsloth DEVE ricevere questo evento per sincronizzare il session_id.
             
-            # Dobbiamo generare un session_id che sia coerente.
-            # Il transport lo genera internamente, ma noi possiamo "forzare" l'annuncio.
+            # Costruiamo il frame: "event: endpoint\ndata: /mcp?session_id=..."
+            # Ma poiché non conosciamo il session_id esatto, proviamo ad annunciare 
+            # l'endpoint base. Se il client è intelligente, lo integrerà.
             
-            # Nota: Invece di cercare la session_id interna, usiamo l'URL che il client si aspetta.
-            # Se il client non riceve l'evento, non saprà mai dove mandare il POST.
+            logger.info("[SSE] MANUALLY INJECTING 'endpoint' event into SSE stream.")
             
-            # Inviaamo un frame SSE manuale:
-            # event: endpoint
-            # data: /mcp?session_id=...
+            # Usiamo il metodo di scrittura del transport per inviare un frame SSE.
+            # Il protocollo richiede un evento 'endpoint'.
+            await write_stream.send_event("endpoint", MESSAGING_ENDPOINT)
             
-            # Ma come otteniamo il session_id? 
-            # Il transport lo crea durante connect_sse. 
-            # Se non possiamo leggerlo, proviamo a inviare un endpoint "generico" 
-            # che il transport poi mapperà.
+            logger.info("[SSE] Manual injection successful. Starting run loop.")
             
-            # Proviamo a inviare l'annuncio dell'endpoint in modo che il client 
-            # lo veda immediatamente.
-            
-            logger.info("[SSE] Attempting manual injection of 'endpoint' event.")
-            
-            # Invia il frame SSE per l'endpoint. 
-            # Usiamo il metodo 'send' del transport se disponibile, 
-            # o scriviamo direttamente nel write_stream.
-            
-            # Il protocollo richiede: "event: endpoint\ndata: [URL]\n\n"
-            # Proviamo a inviare un messaggio che il client deve interpretare.
-            
-            # Se il transport non supporta l'invio manuale di eventi, 
-            # useremo una tecnica di "shadowing".
-            
-            logger.info("[SSE] Starting low-level run loop.")
             try:
                 from mcp.types import InitializationOptions
                 init_opts = InitializationOptions()
             except ImportError:
                 init_opts = None
+
+            await server._lowlevel_server.run(read_stream, write_stream, init_opts)
 
             await server._lowlevel_server.run(read_stream, write_stream, init_opts)
             
