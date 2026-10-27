@@ -34,7 +34,6 @@ asgi_send_var: ContextVar[Callable] = ContextVar("asgi_send")
 
 app = FastAPI(title="Laya MCP Universal Bridge")
 
-# L'endpoint di messaggistica che annunceremo.
 MESSAGING_ENDPOINT = "/mcp"
 transport = SseServerTransport(MESSAGING_ENDPOINT)
 
@@ -50,8 +49,7 @@ class LayaPrimitiveMiddleware:
             
             path = scope.get("path", "")
             
-            # --- FIX 1: POST BYPASS ---
-            # Intercettiamo i POST per evitare che FastAPI tenti di gestire la risposta
+            # POST BYPASS: Intercettiamo i POST per evitare conflitti con FastAPI
             if (path.startswith("/mcp") or path.startswith("/message")) and scope["method"] == "POST":
                 logger.info(f"[PROTOCOL] Intercepted {scope['method']} {path}. Bypassing FastAPI.")
                 try:
@@ -80,44 +78,25 @@ async def handle_sse_logic(scope, receive, send):
     logger.info("[SSE] Handshake attempt via GET /sse")
     
     try:
-        # --- FIX 2: PROTOCOL HIJACK (Manual SSE Handshake) ---
-        # Poiché il transport non ci permette di scrivere l'evento 'endpoint' 
-        # dopo la connessione, dobbiamo "iniettarlo" all'inizio della risposta ASGI.
-        
-        # 1. Inviamo l'header HTTP standard per SSE
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [
-                (b"content-type", b"text/event-stream"),
-                (b"cache-control", b"no-cache"),
-                (b"connection", b"keep-alive"),
-            ],
-        })
-
-        # 2. Inviiamo immediatamente l'evento 'endpoint' richiesto da Unsloth
-        # Questo assicura che il client riceva l'annuncio prima di qualsiasi altro frame.
-        logger.info(f"[SSE] Manually injecting 'endpoint' event: {MESSAGING_ENDPOINT}")
-        endpoint_payload = f"event: endpoint\ndata: {MESSAGING_ENDPOINT}\n\n".encode("utf-8")
-        await send({
-            "type": "http.response.body",
-            "body": endpoint_payload,
-            "more_body": False, # Nota: Questo è delicato in ASGI, ma serve per l'annuncio immediato
-        })
-
-        # 3. Ora che l'handshake è stato "completato" con l'annuncio, 
-        # passiamo il controllo al transport per gestire il flusso di dati continuo.
-        # Nota: Usiamo il context manager del transport per gestire la sessione.
-        # Poiché abbiamo già inviato l'inizio della risposta, il transport 
-        # dovrà gestire la parte 'body' successiva.
-        
-        # Importante: Alcuni transport implementano connect_sse() assumendo di 
-        # dover gestire anche l'invio di 'http.response.start'. 
-        # Se il trasporto fallisce perché la risposta è già stata iniziata, 
-        # dovremo passare a un approccio basato su stream di byte.
-        
+        # 1. LASCIAMO CHE IL TRANSPORT GESTISCA L'HANDSHAKE HTTP (headers + start)
+        # Questo evita il RuntimeError: Unexpected ASGI message 'http.response.start'
         async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
-            logger.info("[SSE] SSE connection established via hijack. Starting run loop.")
+            
+            # 2. INIEZIONE DELL'EVENTO 'ENDPOINT' VIA PRIMITIVA ASGI
+            # Invece di usare write_stream.write (che fallisce con AttributeError),
+            # usiamo la funzione 'send' originale. Inviando un messaggio di tipo 
+            # 'http.response.body' con 'more_body=True', iniettiamo il frame SSE 
+            # senza chiudere la connessione.
+            logger.info(f"[SSE] Injecting 'endpoint' event via raw ASGI send.")
+            endpoint_payload = f"event: endpoint\ndata: {MESSAGING_ENDPOINT}\n\n".encode("utf-8")
+            
+            await send({
+                "type": "http.response.body",
+                "body": endpoint_payload,
+                "more_body": True, # Fondamentale per non terminare la risposta
+            })
+
+            logger.info("[SSE] SSE connection established. Starting run loop.")
             
             try:
                 from mcp.types import InitializationOptions
@@ -125,6 +104,7 @@ async def handle_sse_logic(scope, receive, send):
             except ImportError:
                 init_opts = None
 
+            # 3. AVVIO DEL SERVER MCP
             await server._lowlevel_server.run(read_stream, write_stream, init_opts)
             
     except Exception as e:
@@ -135,7 +115,6 @@ async def handle_sse_logic(scope, receive, send):
 
 @app.get("/sse")
 async def sse_endpoint(request: Request):
-    """Handles the GET /sse handshake."""
     scope = asgi_scope_var.get()
     receive = asgi_receive_var.get()
     send = asgi_send_var.get()
@@ -143,7 +122,7 @@ async def sse_endpoint(request: Request):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "bridge": "hijack_version_v1"}
+    return {"status": "ok", "bridge": "elegant_injection_v2"}
 
 if __name__ == "__main__":
     import uvicorn
