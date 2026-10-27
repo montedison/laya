@@ -1,7 +1,7 @@
 """
-Laya MCP SSE Bridge (Ultra-Stable Version).
-Questa versione è progettata per essere "bulletproof" contro client che inviano 
-richieste malformate o fuori ordine, evitando crash ASGI.
+Laya MCP SSE Bridge (2026 Spec-Compliant Version).
+Questa versione allinea il bridge alla specifica MCP 2026-07-28 
+e al comportamento specifico dei client Unsloth/FastMCP.
 """
 
 import os
@@ -9,7 +9,7 @@ import logging
 import sys
 from contextvars import ContextVar
 from typing import Any, Callable, Dict, Tuple
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import JSONResponse
 from mcp.server.sse import SseServerTransport
 from laya.mcp.server import server
@@ -33,8 +33,11 @@ asgi_scope_var: ContextVar[Dict[str, Any]] = ContextVar("asgi_scope")
 asgi_receive_var: ContextVar[Callable] = ContextVar("asgi_receive")
 asgi_send_var: ContextVar[Callable] = ContextVar("asgi_send")
 
-app = FastAPI(title="Laya MCP Universal Bridge")
-transport = SseServerTransport("/sse")
+app = FastAPI(title="Laya MCP 2026 Compliant Bridge")
+
+# IL FIX CRITICO: Impostiamo l'endpoint di messaggistica su "/mcp" 
+# per allinearci a ciò che Unsloth/FastMCP si aspetta di chiamare.
+transport = SseServerTransport("/mcp")
 
 class LayaPrimitiveMiddleware:
     def __init__(self, app):
@@ -53,6 +56,7 @@ app.add_middleware(LayaPrimitiveMiddleware)
 async def handle_sse_logic(scope, receive, send):
     """Gestisce la connessione GET /sse."""
     try:
+        # Il transport ora annuncerà l'endpoint "/mcp" via SSE
         async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
             logger.info("[SSE] Sessione stabilita. Avvio loop 'run'...")
             try:
@@ -60,57 +64,48 @@ async def handle_sse_logic(scope, receive, send):
                 init_opts = InitializationOptions()
             except ImportError:
                 init_opts = None
-            # Chiamata posizionale per compatibilità SDK
+            
+            # Chiamata posizionale al motore low-level
             await server._lowlevel_server.run(read_stream, write_stream, init_opts)
     except Exception as e:
         logger.error(f"[SSE] Errore durante la sessione SSE: {e}", exc_info=True)
         raise
 
 async def handle_message_logic(scope, receive, send):
-    """Gestisce la ricezione dei messaggi POST."""
+    """Gestisce la ricezione dei messaggi POST su /mcp."""
     query_params = scope.get("query_string", b"").decode()
     
-    # Se non c'è session_id, non tentare di processare, rispondi subito con 400.
     if "session_id" not in query_params:
-        logger.warning(f"[POST] [REJECTED] Messaggio ricevuto SENZA session_id. Query: {query_params}")
-        # Usiamo una risposta diretta per evitare che FastAPI provochi un RuntimeError ASGI
+        logger.warning(f"[POST] [REJECTED] Messaggio senza session_id. Query: {query_params}")
         response = JSONResponse(
             status_code=400, 
-            content={"error": "missing_session_id", "message": "A session_id is required for all POST requests."}
+            content={"error": "missing_session_id", "message": "session_id is required"}
         )
         await response(scope, receive, send)
         return
 
     try:
         await transport.handle_post_message(scope, receive, send)
-        logger.debug("[POST] Messaggio processato con successo.")
+        logger.debug("[POST] Messaggio processato correttamente.")
     except Exception as e:
-        logger.error(f"[POST] Errore elaborazione messaggio: {e}")
-        # Fallback sicuro per l'errore
-        response = JSONResponse(
-            status_code=500, 
-            content={"error": "internal_error", "message": str(e)}
-        )
+        logger.error(f"[POST] Errore elaborazione: {e}")
+        response = JSONResponse(status_code=500, content={"error": str(e)})
         await response(scope, receive, send)
 
-# --- ROUTING UNIVERSALE ---
+# --- ROUTING ---
 
-@app.api_route("/sse", methods=["GET", "POST"])
-async def sse_router(request: Request):
+@app.get("/sse")
+async def sse_endpoint(request: Request):
+    """Endpoint per l'handshake SSE."""
     scope = asgi_scope_var.get()
     receive = asgi_receive_var.get()
     send = asgi_send_var.get()
-
-    if request.method == "GET":
-        return await handle_sse_logic(scope, receive, send)
-    else:
-        # Per il POST, usiamo la logica dedicata che gestisce la risposta direttamente
-        await handle_message_logic(scope, receive, send)
-        return Response(status_code=200) # Placeholder
+    return await handle_sse_logic(scope, receive, send)
 
 @app.post("/mcp")
 @app.post("/message")
-async def message_redirect(request: Request):
+async def message_endpoint(request: Request):
+    """Endpoint per i messaggi (allineato a Unsloth)."""
     scope = asgi_scope_var.get()
     receive = asgi_receive_var.get()
     send = asgi_send_var.get()
@@ -119,7 +114,7 @@ async def message_redirect(request: Request):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "bridge": "ultra_stable_mode"}
+    return {"status": "ok", "spec": "2026-07-28"}
 
 if __name__ == "__main__":
     import uvicorn
