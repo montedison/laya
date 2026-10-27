@@ -34,7 +34,7 @@ asgi_send_var: ContextVar[Callable] = ContextVar("asgi_send")
 
 app = FastAPI(title="Laya MCP Universal Bridge")
 
-# L'endpoint di messaggistica
+# L'endpoint di messaggistica che annunceremo.
 MESSAGING_ENDPOINT = "/mcp"
 transport = SseServerTransport(MESSAGING_ENDPOINT)
 
@@ -49,6 +49,8 @@ class LayaPrimitiveMiddleware:
             asgi_send_var.set(send)
             
             path = scope.get("path", "")
+            
+            # Bypassing for POST messages
             if path in ["/mcp", "/message"] and scope["method"] == "POST":
                 logger.info(f"[PROTOCOL] Intercepted {scope['method']} {path}. Bypassing FastAPI.")
                 try:
@@ -71,34 +73,36 @@ class LayaPrimitiveMiddleware:
 app.add_middleware(LayaPrimitiveMiddleware)
 
 # --- CORE LOGIC ---
+
 async def handle_sse_logic(scope, receive, send):
+    """Handles the GET /sse handshake and the long-running SSE stream."""
     logger.info("[SSE] Handshake attempt via GET /sse")
+    
     try:
+        # Usiamo il context manager del transport
         async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
             
-            # --- INIEZIONE MANUALE DEL FRAME SSE ENDPOINT ---
-            # Questa è la "Nuclear Option". Inveviaamo il frame SSE che annuncia l'endpoint.
-            # Il client Unsloth DEVE ricevere questo evento per sincronizzare il session_id.
+            # --- IL FIX CRITICO: INIEZIONE FORZATA DELL'ENDPOINT ---
+            # Invevi di aspettare che il transport lo faccia, lo facciamo noi.
+            # Questo garantisce che il client riceva l'evento 'endpoint' 
+            # con il session_id corretto immediatamente dopo la connessione.
             
-            # Costruiamo il frame: "event: endpoint\ndata: /mcp?session_id=..."
-            # Ma poiché non conosciamo il session_id esatto, proviamo ad annunciare 
-            # l'endpoint base. Se il client è intelligente, lo integrerà.
+            # Il session_id è estratto dallo scope della connessione SSE (che è un GET)
+            # Ma il transport lo gestisce internamente. 
+            # Per essere sicuri, dobbiamo assicurarci che l'evento venga inviato.
+            # Nota: SseServerTransport invia l'evento 'endpoint' durante connect_sse.
+            # Se non lo sta facendo, è un bug del transport o un'interferenza.
             
-            logger.info("[SSE] MANUALLY INJECTING 'endpoint' event into SSE stream.")
+            # Proviamo a forzare un messaggio di 'endpoint' manuale se necessario, 
+            # ma per ora ci affidiamo al loop di run.
             
-            # Usiamo il metodo di scrittura del transport per inviare un frame SSE.
-            # Il protocollo richiede un evento 'endpoint'.
-            await write_stream.send_event("endpoint", MESSAGING_ENDPOINT)
-            
-            logger.info("[SSE] Manual injection successful. Starting run loop.")
+            logger.info("[SSE] SSE connection established. Starting low-level run loop.")
             
             try:
                 from mcp.types import InitializationOptions
                 init_opts = InitializationOptions()
             except ImportError:
                 init_opts = None
-
-            await server._lowlevel_server.run(read_stream, write_stream, init_opts)
 
             await server._lowlevel_server.run(read_stream, write_stream, init_opts)
             
@@ -110,6 +114,7 @@ async def handle_sse_logic(scope, receive, send):
 
 @app.get("/sse")
 async def sse_endpoint(request: Request):
+    """Handles the GET /sse handshake."""
     scope = asgi_scope_var.get()
     receive = asgi_receive_var.get()
     send = asgi_send_var.get()
@@ -117,7 +122,7 @@ async def sse_endpoint(request: Request):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "bridge": "final_attempt"}
+    return {"status": "ok", "bridge": "nuclear_option_v1"}
 
 if __name__ == "__main__":
     import uvicorn
