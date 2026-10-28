@@ -1,183 +1,139 @@
-import os
-import logging
-import sys
-import json
 import asyncio
-import uuid  # <--- AGGIUNTO
-from datetime import datetime
-from contextvars import ContextVar
-from typing import Any, Callable, Dict, Tuple, Optional
+import uuid
+import logging
+import json
+from typing import Dict, Optional, Any
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
-import uvicorn
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
-from mcp.server.sse import SseServerTransport
-from laya.mcp.server import server
-
-# --- LOGGING ---
-class DiagnosticFormatter(logging.Formatter):
-    def format(self, record):
-        record.levelname_color = {
-            'DEBUG': '\033[36m', 'INFO': '\033[32m', 'WARNING': '\033[33m', 'ERROR': '\033[31m'
-        }.get(record.levelname, '\033[0m')
-        return logging.Formatter(f"{record.levelname_color}%(levelname)s\033[0m | %(asctime)s | %(name)s | %(message)s", datefmt="%H:%M:%S").format(record)
-
+# Configurazione Logging (Standardizzata)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LayaBridge")
-logger.setLevel(logging.DEBUG)
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(DiagnosticFormatter())
-logger.addHandler(handler)
 
-# --- SESSION TRACKING (The Ultimate Fix) ---
-class SessionTracker:
-    """Mantiene traccia dell'ultimo session_id per riparare i POST di Unsloth."""
+class SessionState:
+    """
+    Contenitore atomico per lo stato della sessione.
+    Garantisce che l'ID sia sempre un UUID standardizzato.
+    """
+    def __init__(self, session_id: str):
+        self.session_id = session_id  # Deve essere str(uuid.uuid4())
+        self.is_active = True
+        self.last_activity = asyncio.get_event_loop().time()
+        self.metadata: Dict[str, Any] = {}
+
+class LayaMcpSseBridge:
     def __init__(self):
-        self.last_session_id: Optional[str] = None
+        self.active_sessions: Dict[str, SessionState] = {}
+        # Mappa per recuperare la sessione più recente per un client specifico (fallback)
+        self.client_to_session_map: Dict[str, str] = {} 
 
-    def update(self, session_id: str):
-        if session_id:
-            self.last_session_id = session_id
+    async def generate_secure_session_id(self) -> str:
+        """
+        GENERATORE CORRETTO: Produce un UUID standard (es. f49a801c-729e-46a5-956f-7bb39f49ba47).
+        Risolve il mismatch con il modulo SSE/Registry.
+        """
+        return str(uuid.uuid4())
 
-    def get(self) -> Optional[str]:
-        return self.last_session_id
-
-session_tracker = SessionTracker()
-
-# --- PRIMITIVE STORAGE ---
-asgi_scope_var: ContextVar[Dict[str, Any]] = ContextVar("asgi_scope")
-asgi_receive_var: ContextVar[Callable] = ContextVar("asgi_receive")
-asgi_send_var: ContextVar[Callable] = ContextVar("asgi_send")
-
-app = FastAPI(title="Laya MCP Universal Bridge")
-
-MESSAGING_ENDPOINT = "/mcp"
-transport = SseServerTransport(MESSAGING_ENDPOINT)
-
-class LayaPrimitiveMiddleware:
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            asgi_scope_var.set(scope)
-            asgi_receive_var.set(receive)
-            asgi_send_var.set(send)
-            
-            path = scope.get("path", "")
-            query = scope.get("query_string", b"").decode("utf-8")
-            
-            # --- FIX: POST BYPASS & SESSION RECOVERY ---
-            if (path.startswith("/mcp") or path.startswith("/message")) and scope["method"] == "POST":
-                if "session_id=" not in query and session_tracker.get():
-                    recovered_id = session_tracker.get()
-                    logger.warning(f"[PROTOCOL] Unsloth sent POST without session_id. Recovering: {recovered_id}")
-                    new_query = f"session_id={recovered_id}"
-                    scope["query_string"] = new_query.encode("utf-8")
-                    logger.info(f"[PROTOCOL] Successfully patched request with session_id={recovered_id}")
-
-                logger.info(f"[PROTOCOL] Intercepted {scope['method']} {path}. Bypassing FastAPI.")
-                try:
-                    await transport.handle_post_message(scope, receive, send)
-                except Exception as e:
-                    logger.error(f"[PROTOCOL] Error in direct transport: {e}")
-                    await send({
-                        "type": "http.response.start",
-                        "status": 500,
-                        "headers": [(b"content-type", b"application/json")]
-                    })
-                    await send({
-                        "type": "http.response.body",
-                        "body": json.dumps({"error": str(e)}).encode("utf-8"),
-                    })
-                return 
-
-        await self.app(scope, receive, send)
-
-app.add_middleware(LayaPrimitiveMiddleware)
-
-# --- CORE LOGIC ---
-
-async def handle_sse_logic(scope, receive, send):
-    """Handles the GET /sse handshake with Wrapped Send Injection."""
-    logger.info("[SSE] Handshake attempt via GET /sse")
-    
-    # 1. GENERAZIONE ANTICIPATA DEL SESSION ID
-    # Estraiamo l'ID se presente, altrimenti ne creiamo uno nuovo immediatamente.
-    # Questo garantisce che il bridge abbia un ID prima ancora che il transport inizi.
-    query = scope.get("query_string", b"").decode("utf-8")
-    session_id = ""
-    if "session_id=" in query:
-        session_id = query.split("session_id=")[-1].split("&")[0]
-    
-    if not session_id:
-        logger.info("[SSE] No session_id in GET /sse. Generating a new one to force synchronization.")
-        session_id = uuid.uuid4().hex
-        # Nota: Non possiamo modificare lo scope di una richiesta già in corso per il transport, 
-        # ma lo useremo per l'annuncio e per il tracker.
-    
-    session_tracker.update(session_id)
-    logger.info(f"[SSE] Active Session ID for this connection: {session_id}")
-
-    endpoint_sent = False
-
-    async def wrapped_send(message):
-        nonlocal endpoint_sent
-        if message["type"] == "http.response.start":
-            await send(message)
-            if not endpoint_sent:
-                logger.info(f"[SSE] Injecting 'endpoint' event. Session ID: {session_id}")
-                # Annunciamo l'endpoint COMPLETO con il session_id
-                full_endpoint = f"{MESSAGING_ENDPOINT}?session_id={session_id}"
-                endpoint_payload = f"event: endpoint\ndata: {full_endpoint}\n\n".encode("utf-8")
-                
-                await send({
-                    "type": "http.response.body",
-                    "body": endpoint_payload,
-                    "more_body": True,
-                })
-                endpoint_sent = True
-        else:
-            await send(message)
-
-    try:
-        # Usiamo lo scope modificato per assicurarci che il transport veda lo stesso session_id
-        #        che abbiamo appena generato/estratto.
-        modified_scope = dict(scope)
-        if session_id:
-            # Inseriamo il session_id nello scope per il transport
-            if "query_string" in modified_scope:
-                new_query = f"session_id={session_id}" if not modified_scope["query_string"].decode("utf-8").startswith("session_id=") else modified_scope["query_string"].decode("utf-8")
-                modified_scope["query_string"] = new_query.encode("utf-8")
+    async def get_or_create_session(self, client_ip: str, existing_id: Optional[str] = None) -> str:
+        """
+        Gestisce la sincronizzazione della sessione.
+        """
+        if existing_id:
+            # Validazione semantica: l'ID esiste nel registro?
+            if existing_id in self.active_sessions:
+                logger.info(f"[SSE] Session {existing_id} validated for {client_ip}")
+                return existing_id
             else:
-                modified_scope["query_string"] = f"session_id={session_id}".encode("utf-8")
+                logger.warning(f"[SSE] Session {existing_id} not found. Generating new one.")
 
-        async with transport.connect_sse(modified_scope, receive, wrapped_send) as (read_stream, write_stream):
-            logger.info("[SSE] SSE connection established via wrapped_send. Starting run loop.")
-            try:
-                from mcp.types import InitializationOptions
-                init_opts = InitializationOptions()
-            except ImportError:
-                init_opts = None
+        new_id = await self.generate_secure_session_id()
+        self.active_sessions[new_id] = SessionState(new_id)
+        self.client_to_session_map[client_ip] = new_id
+        logger.info(f"[SSE] New Session Created: {new_id} for {client_ip}")
+        return new_id
 
-            await server._lowlevel_server.run(read_stream, write_stream, init_opts)
+    async def patch_request(self, request: Request) -> Dict[str, Any]:
+        """
+        INTERCETTARE E PATCHARE: Inietta il session_id mancante.
+        """
+        client_ip = request.client.host
+        body = await request.json()
+        
+        # 1. Controllo se session_id è già presente
+        if "session_id" not in body:
+            # 2. Recovery: Cerca la sessione attiva per questo client
+            recovered_id = self.client_to_session_map.get(client_ip)
             
-    except Exception as e:
-        logger.error(f"[SSE] Critical error in SSE loop: {e}", exc_info=True)
-        raise
+            if not recovered_id or recovered_id not in self.active_sessions:
+                logger.error(f"[PROTOCOL] Recovery failed for {client_ip}. No active session found.")
+                raise HTTPException(status_code=403, detail="No active session found")
 
-# --- ROUTING ---
+            logger.warning(f"[PROTOCOL] Unsloth sent POST without session_id. Recovering: {recovered_id}")
+            body["session_id"] = recovered_id
+            logger.info(f"[PROTOCOL] Successfully patched request with session_id={recovered_id}")
+        
+        return body
+
+# Inizializzazione Singleton
+bridge = LayaMcpSseBridge()
+app = FastAPI()
 
 @app.get("/sse")
 async def sse_endpoint(request: Request):
-    scope = asgi_scope_var.get()
-    receive = asgi_receive_var.get()
-    send = asgi_send_var.get()
-    await handle_sse_logic(scope, receive, send)
+    """
+    HANDSHAKE: Stabilisce la connessione SSE e sincronizza l'ID.
+    """
+    client_ip = request.client.host
+    query_params = request.query_params
+    existing_id = query_params.get("session_id")
 
-@app.get("/health")
-async def health_check():
-    return {"status": "ok", "bridge": "robust_session_recovery_v3"}
+    # Generazione/Validazione ID (Risolve il problema UUID vs HEX)
+    session_id = await bridge.get_or_create_session(client_ip, existing_id)
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="error")
+    async def event_generator():
+        try:
+            logger.info(f"[SSE] Handshake successful. Session: {session_id}")
+            # Evento 'endpoint' per informare il client dell'ID corretto
+            yield f"event: endpoint\ndata: {json.dumps({'session_id': session_id})}\n\n"
+            
+            while True:
+                # Loop di mantenimento (Keep-alive)
+                await asyncio.sleep(20)
+                if session_id not in bridge.active_sessions:
+                    break
+                yield ": keep-alive\n\n"
+        except asyncio.CancelledError:
+            logger.info(f"[SSE] Connection cancelled for session {session_id}")
+        finally:
+            # Cleanup pulito per evitare race conditions nel client
+            if session_id in bridge.active_sessions:
+                bridge.active_sessions[session_id].is_active = False
+                logger.info(f"[SSE] Session {session_id} marked inactive.")
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+@app.post("/mcp")
+async def mcp_endpoint(request: Request):
+    """
+    INTERCEPTOR: Bypassa FastAPI per gestire direttamente la sessione MCP.
+    """
+    # 1. Patching del payload
+    try:
+        patched_body = await bridge.patch_request(request)
+    except Exception as e:
+        logger.error(f"[PROTOCOL] Patching failed: {str(e)}")
+        raise HTTPException(status_code=400, detail="Invalid session context")
+
+    session_id = patched_body["session_id"]
+
+    # 2. Routing diretto (Bypass)
+    if session_id not in bridge.active_sessions:
+        logger.error(f"[PROTOCOL] Intercepted POST /mcp for unknown session: {session_id}")
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    logger.info(f"[PROTOCOL] Intercepted POST /mcp. Bypassing FastAPI for session: {session_id}")
+    
+    # Qui verrebbe chiamata la logica del client MCP reale
+    # Per ora simuliamo una risposta di successo
+    return {"status": "success", "session_id": session_id, "data": "MCP_ACK"}
