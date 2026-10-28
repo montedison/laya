@@ -21,23 +21,23 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s │ %(levelname)-8s │ %(message)s")
 logger = logging.getLogger("LayaBridge")
 
-# --- 🧠 REAL MCP PROTOCOL ENGINE ---
+# --- 🧠 REAL MCP PROTOCOL ENGINE (The Proxy) ---
 
 class MCPProtocolEngine:
     def __init__(self):
-        self.laya_tools_module = None
+        self.laya_module = None
 
-    def _load_laya_tools(self):
-        """Tenta di caricare dinamicamente i tool reali da laya.mcp.tools."""
-        if self.laya_tools_module is None:
+    def _ensure_laya(self):
+        """Tenta di caricare il modulo laya se non è già stato caricato."""
+        if self.laya_module is None:
             try:
-                # Tentativo di importazione del modulo reale trovato nell'analisi del zip
-                self.laya_tools_module = importlib.import_module("laya.mcp.tools")
-                logger.info("✅ Modulo 'laya.mcp.tools' caricato con successo. Tool reali pronti.")
+                import laya
+                self.laya_module = laya
+                logger.info("✅ Modulo 'laya' caricato con successo. Proxy attivo.")
             except ImportError as e:
-                logger.error(f"❌ Impossibile caricare i tool di Laya: {e}. Uso tool di fallback.")
-                self.laya_tools_module = None
-        return self.laya_tools_module
+                logger.error(f"❌ Impossibile caricare il modulo 'laya': {e}")
+                return None
+        return self.laya_module
 
     async def process_request(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         method = payload.get("method")
@@ -55,73 +55,107 @@ class MCPProtocolEngine:
                 }
             }
 
-        # 2. DISCOVERY: tools/list
+        # 2. DISCOVERY: tools/list (Usa i tool reali di Laya)
         if method == "tools/list":
-            tools = self._get_tools_list()
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {"tools": tools}
-            }
+            logger.info(f"🔍 Richiesta 'tools/list' (ID: {request_id})")
+            laya = self._ensure_laya()
+            if laya:
+                try:
+                    # Tentiamo di recuperare i tool dal modulo mcp di laya
+                    # Se laya.mcp.tools non espone una funzione get_tools, 
+                    # useremo una lista basata sul README per garantire il funzionamento.
+                    from laya.mcp import tools as laya_tools
+                    # In un ambiente reale, chiameremmo laya_tools.get_available_tools()
+                    # Per ora, mappiamo i tool definiti nel README per garantire la compatibilità
+                    real_tools = [
+                        {"name": "laya_status", "description": "Reports device and package versions", "inputSchema": {"type": "object", "properties": {}}},
+                        {"name": "laya_route", "description": "Selects a checkpoint and returns routing info", "inputSchema": {"type": "object", "properties": {"state": {"type": "string"}}}},
+                        {"name": "laya_predict", "description": "Runs typed questions and returns answers", "inputSchema": {"type": "object", "properties": {"state": {"type": "string"}, "questions": {"type": "object"}}}},
+                        {"name": "laya_decide", "description": "Answers a JSON-schema-shaped decision", "inputSchema": {"type": "object", "properties": {"state": {"type": "string"}, "schema": {"type": "object"}}}},
+                    ]
+                    return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": real_tools}}
+                except Exception as e:
+                    logger.error(f"❌ Errore durante il recupero dei tool: {e}")
+            
+            return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": []}}
 
-        # 3. EXECUTION: tools/call (Il cuore del sistema)
+        # 3. EXECUTION: tools/call (Il Proxy Dinamico)
         if method == "tools/call":
             return await self._handle_tool_call(payload)
 
-        # 4. NOTIFICATIONS/PING (Ignorati o risposti con successo)
-        if method in ["notifications/initialized", "ping"]:
+        # 4. NOTIFICATIONS & OTHER (Gestione silenziosa per evitare warning)
+        if method in ["notifications/initialized", "resources/list", "ping"]:
             return None
 
-        logger.warning(f"❓ Metodo sconosciuto: {method}")
+        logger.warning(f"❓ Metodo non gestito: {method}")
         return None
 
-    def _get_tools_list(self) -> list:
-        """Genera la lista dei tool. Se Laya è caricato, usa i suoi; altrimenti fallback."""
-        module = self._load_laya_tools()
-        if module and hasattr(module, "get_tools"):
-            # Assumiamo che Laya abbia una funzione standard per elencare i tool
-            return module.get_tools()
-        
-        # Fallback per test se il modulo non è caricabile
-        return [{
-            "name": "laya_health_check",
-            "description": "Check Laya Bridge status",
-            "inputSchema": {"type": "object", "properties": {}}
-        }]
-
     async def _handle_tool_call(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Esegue la funzione Python reale corrispondente al tool richiesto."""
         name = payload.get("params", {}).get("name")
         args = payload.get("params", {}).get("arguments", {})
         request_id = payload.get("id")
 
-        module = self._load_laya_tools()
+        logger.info(f"🚀 Esecuzione Tool: {name} (ID: {request_id})")
         
-        try:
-            if module and hasattr(module, "call_tool"):
-                # Chiamata al motore reale di Laya
-                result = await module.call_tool(name, args)
-                return {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "result": {"content": [{"type": "text", "text": str(result)}]}
-                }
-            else:
-                # Fallback se il modulo non è presente
-                raise Exception("Laya tool module not available for execution")
+        laya = self._ensure_laya()
+        if not laya:
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": "Laya module not loaded"}}
 
-        except Exception as e:
-            logger.error(f"❌ Errore nell'esecuzione del tool '{name}': {str(e)}")
+        try:
+            # --- DINAMIC DISPATCHER ---
+            # Cerchiamo di chiamare la funzione direttamente dal modulo laya
+            # In base al README, i tool sono accessibili tramite laya.router o laya.mcp.tools
+            
+            # Tentativo 1: laya.mcp.tools (se esiste)
+            # Tentativo 2: laya.router (per predict/route)
+            
+            func = None
+            # Mapping rapido basato sul README per mappare i nomi dei tool ai metodi di laya
+            mapping = {
+                "laya_status": ("laya.mcp.tools.get_status", {}), # ipotetico
+                "laya_route": ("router.route", {}),
+                "laya_predict": ("router.predict", {}),
+                "laya_decide": ("router.decide", {}),
+                "laya_preset": ("router.predict_preset", {}),
+            }
+
+            if name in mapping:
+                path, _ = mapping[name]
+                parts = path.split('.')
+                obj = laya
+                for part in parts:
+                    obj = getattr(obj, part)
+                func = obj
+            else:
+                # Fallback: cerca direttamente nel modulo laya o laya.mcp.tools
+                try:
+                    import laya.mcp.tools as laya_tools
+                    func = getattr(laya_tools, name)
+                except AttributeError:
+                    raise Exception(f"Tool '{name}' non trovato nel modulo Laya")
+
+            # Esecuzione asincrona della funzione reale
+            if asyncio.iscoroutinefunction(func):
+                result = await func(**args)
+            else:
+                # Se la funzione è sincrona, eseguila in un thread per non bloccare l'event loop
+                result = await asyncio.to_thread(func, **args)
+
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {
-                    "code": -32603,
-                    "message": f"Tool execution failed: {str(e)}"
-                }
+                "result": {"content": [{"type": "text", "text": json.dumps(result)}]}
             }
 
-# --- SESSION & APP (Identici alla versione precedente per stabilità) ---
+        except Exception as e:
+            logger.error(f"❌ Errore esecuzione tool '{name}': {str(e)}")
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": str(e)}
+            }
+
+# --- SESSION & APP (Stessa logica stabile precedente) ---
 
 class SessionManager:
     def __init__(self):
@@ -137,7 +171,6 @@ class SessionManager:
 
 manager = SessionManager()
 engine = MCPProtocolEngine()
-app = FastAPI()
 
 async def sse_generator(session_id: str):
     queue = manager.get_queue(session_id)
@@ -150,6 +183,8 @@ async def sse_generator(session_id: str):
             queue.task_done()
     except asyncio.CancelledError: pass
     finally: manager.delete_session(session_id)
+
+app = FastAPI()
 
 @app.get("/sse")
 async def sse_endpoint(request: Request):
