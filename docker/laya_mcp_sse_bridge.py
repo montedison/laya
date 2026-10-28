@@ -3,13 +3,25 @@ import json
 import logging
 import uuid
 import importlib
-from typing import Any, Dict, Optional, List, Callable, Awaitable
+import sys
+from typing import Any, Dict, Optional, List, Callable
 
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import StreamingResponse
 import uvicorn
 
-# --- SMART RESILIENT IMPORTS ---
+# --- FORCE LOGGING IMMEDIATELY ---
+# Configuriamo il logging PRIMA di qualsiasi altra cosa per vedere i messaggi di debug
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s │ %(levelname)-8s │ %(message)s",
+    stream=sys.stdout # Forza l'output su stdout per Docker
+)
+logger = logging.getLogger("LayaBridge")
+
+logger.info("🚀 [STARTUP] Bridge process inizializzato. Preparazione ambiente...")
+
+# --- RESILIENT IMPORTS ---
 try:
     from mcp.types import InitializationOptions
 except ImportError:
@@ -18,99 +30,74 @@ except ImportError:
     except ImportError:
         from typing import Any
         InitializationOptions = Any
-        # Silenziamo il warning come concordato per evitare rumore nei log di produzione
-        logging.disable(logging.WARNING) 
+        logger.warning("⚠️ [Resilience] 'InitializationOptions' non trovato. Uso 'Any'.")
 
-# --- LOGGING CONFIGURATION ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s │ %(levelname)-8s │ %(message)s")
-logger = logging.getLogger("LayaBridge")
-
-# --- 🧠 UNIFIED MCP PROTOCOL ENGINE ---
+# --- MCP PROTOCOL ENGINE ---
 
 class MCPProtocolEngine:
     def __init__(self):
         self.laya_module = None
         self.router_instance = None
-        # Il Registro Unificato: { "nome_tool": (funzione_callable, schema_dict) }
         self._tool_registry: Dict[str, tuple[Callable, Dict[str, Any]]] = {}
 
     def _ensure_laya(self):
-        """Carica Laya e popola il registro dei tool reali."""
         if self.laya_module is None:
+            logger.info("⏳ [IMPORT] Tentativo di importazione modulo 'laya' in corso... (Potrebbe richiedere tempo se carica i pesi)")
             try:
                 import laya
                 self.laya_module = laya
-                # Tentativo di istanziare il Router di Laya
+                logger.info("✅ [IMPORT] Modulo 'laya' caricato con successo.")
+                
                 try:
                     self.router_instance = laya.Router()
-                    logger.info("✅ Laya Router istanziato con successo.")
+                    logger.info("✅ [ROUTER] Istanza Router di Laya creata.")
                 except Exception as e:
-                    logger.warning(f"⚠️ Impossibile istanziare laya.Router: {e}. Il bridge opererà in modalità fallback.")
+                    logger.warning(f"⚠️ [ROUTER] Impossibile istanziare laya.Router: {e}. Uso modalità fallback.")
                 
                 self._build_unified_registry()
-                logger.info("✅ Registro dei tool unificato creato.")
             except ImportError as e:
-                logger.error(f"❌ Impossibile caricare il modulo 'laya': {e}")
+                logger.error(f"❌ [IMPORT] Errore critico durante l'import di 'laya': {e}")
+                return None
+            except Exception as e:
+                logger.error(f"❌ [IMPORT] Errore imprevisto durante l'import di 'laya': {e}")
                 return None
         return self.laya_module
 
     def _build_unified_registry(self):
-        """Costruisce il registro incrociando i tool di Laya con la struttura MCP."""
-        laya = self._ensure_laya()
-        if not laya: return
-
-        # 1. Tentativo di estrazione dai tool reali di Laya (se disponibili)
-        # Se laya.mcp.tools espone una funzione di discovery, la usiamo.
-        try:
-            from laya.mcp import tools as laya_tools
-            # Se laya ha una funzione per elencare i tool, la usiamo per popolare il registro
-            if hasattr(laya_tools, "get_available_tools"):
-                available = laya_tools.get_available_tools()
-                for t in available:
-                    # Mapping: name -> (funzione, schema)
-                    # Nota: Qui dovremmo mappare il nome al callable reale
-                    self._tool_registry[t['name']] = (getattr(laya_tools, t['name']), t['inputSchema'])
-        except Exception as e:
-            logger.warning(f"⚠️ Impossibile mappare i tool dinamici da laya.mcp.tools: {e}")
-
-        # 2. Inserimento Tool di Sistema/Fallback (Garantisce che l'handshake e i test base passino)
-        # Questi sono i tool che Unsloth si aspetta vedere per confermare la connessione
-        self._tool_registry["laya_health_check"] = (
-            self._fallback_health_check, 
-            {"type": "object", "properties": {}}
-        )
-        
-        # 3. Mappatura esplicita dei tool principali del README per sicurezza
-        # Questo risolve l'errore "Tool non trovato nel mapping"
-        mapping_to_router = {
-            "laya_predict": "predict",
-            "laya_predict_batch": "predict_batch",
-            "laya_predict_long": "predict_long",
-            "laya_route": "route",
-            "laya_route_batch": "route_batch",
-            "laya_decide": "decide",
-            "laya_shortlist": "predict_shortlist",
-            "laya_tournament": "predict_tournament",
-            "laya_preset": "predict_preset",
-            "laya_status": "status" # ipotetico
+        logger.info("🛠️ [REGISTRY] Costruzione del registro unificato dei tool...")
+        # 1. Mapping dei tool basato sul README per garantire la stabilità
+        mapping = {
+            "laya_status": ("status", {}),
+            "laya_predict": ("predict", {}),
+            "laya_predict_batch": ("predict_batch", {}),
+            "laya_predict_long": ("predict_long", {}),
+            "laya_route": ("route", {}),
+            "laya_route_batch": ("route_batch", {}),
+            "laya_decide": ("decide", {}),
+            "laya_shortlist": ("predict_shortlist", {}),
+            "laya_tournament": ("predict_tournament", {}),
+            "laya_preset": ("predict_preset", {}),
         }
 
         if self.router_instance:
-            for mcp_name, router_method in mapping_to_router.items():
+            for mcp_name, (method_name, _) in mapping.items():
                 try:
-                    func = getattr(self.router_instance, router_method)
+                    func = getattr(self.router_instance, method_name)
                     self._tool_registry[mcp_name] = (func, {"type": "object", "properties": {}})
                 except AttributeError:
-                    continue
+                    logger.warning(f"⚠️ [REGISTRY] Metodo '{method_name}' non trovato nel Router di Laya.")
+        
+        # 2. Fallback di sicurezza per l'handshake
+        self._tool_registry["laya_health_check"] = (self._fallback_health_check, {"type": "object", "properties": {}})
+        logger.info(f"✅ [REGISTRY] Registro completato. Tool caricati: {list(self._tool_registry.keys())}")
 
     async def _fallback_health_check(self, **kwargs) -> Any:
-        return {"status": "ok", "engine": "laya-mcp-bridge-proxy"}
+        return {"status": "ok", "mode": "fallback"}
 
     async def process_request(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         method = payload.get("method")
         request_id = payload.get("id")
 
-        # --- HANDSHAKE ---
         if method == "initialize":
             return {
                 "jsonrpc": "2.0", "id": request_id,
@@ -121,28 +108,18 @@ class MCPProtocolEngine:
                 }
             }
 
-        # --- DISCOVERY ---
         if method == "tools/list":
-            logger.info(f"🔍 Discovery tools (ID: {request_id})")
-            # Costruiamo la lista partendo dal registro unificato
-            tools_list = []
-            for name, (_, schema) in self._tool_registry.items():
-                tools_list.append({
-                    "name": name,
-                    "description": f"Laya tool: {name}",
-                    "inputSchema": schema
-                })
-            return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": tools_list}}
+            return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": [
+                {"name": n, "description": "Laya tool", "inputSchema": s["inputSchema"]} 
+                for n, (_, s) in self._tool_registry.items()
+            ]}}
 
-        # --- EXECUTION ---
         if method == "tools/call":
             return await self._handle_tool_call(payload)
 
-        # --- NOTIFICATIONS ---
         if method in ["notifications/initialized", "resources/list", "ping"]:
             return None
 
-        logger.warning(f"❓ Metodo non gestito: {method}")
         return None
 
     async def _handle_tool_call(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -151,38 +128,22 @@ class MCPProtocolEngine:
         args = params.get("arguments", {})
         request_id = payload.get("id")
 
-        logger.info(f"🚀 Tool Call: {name} (ID: {request_id})")
-
-        # Ricerca nel registro unificato
         if name not in self._tool_registry:
-            logger.error(f"❌ Tool '{name}' non trovato nel registro unificato.")
-            return {
-                "jsonrpc": "2.0", "id": request_id,
-                "error": {"code": -32601, "message": f"Tool '{name}' not found"}
-            }
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Tool '{name}' not found"}}
 
         func, _ = self._tool_registry[name]
-
         try:
-            # Esecuzione della funzione (gestisce sync e async)
+            logger.info(f"🚀 [EXEC] Esecuzione tool: {name} (ID: {request_id})")
             if asyncio.iscoroutinefunction(func):
                 result = await func(**args)
             else:
                 result = await asyncio.to_thread(func, **args)
-
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {"content": [{"type": "text", "text": json.dumps(result)}]}
-            }
+            return {"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": json.dumps(result)}]}}
         except Exception as e:
-            logger.error(f"❌ Errore esecuzione '{name}': {str(e)}")
-            return {
-                "jsonrpc": "2.0", "id": request_id,
-                "error": {"code": -32603, "message": str(e)}
-            }
+            logger.error(f"❌ [EXEC] Errore tool '{name}': {str(e)}")
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": str(e)}}
 
-# --- SESSION & APP (Stabilità garantita) ---
+# --- SESSION & APP ---
 
 class SessionManager:
     def __init__(self):
@@ -198,6 +159,7 @@ class SessionManager:
 
 manager = SessionManager()
 engine = MCPProtocolEngine()
+app = FastAPI()
 
 async def sse_generator(session_id: str):
     queue = manager.get_queue(session_id)
@@ -211,8 +173,6 @@ async def sse_generator(session_id: str):
     except asyncio.CancelledError: pass
     finally: manager.delete_session(session_id)
 
-app = FastAPI(title="Laya MCP High-Fidelity Adapter")
-
 @app.get("/sse")
 async def sse_endpoint(request: Request):
     return StreamingResponse(sse_generator(manager.create_session()), media_type="text/event-stream")
@@ -221,13 +181,13 @@ async def sse_endpoint(request: Request):
 async def mcp_endpoint(request: Request, session_id: str = Query(None)):
     if not session_id or not manager.get_queue(session_id):
         raise HTTPException(status_code=400, detail="Invalid Session")
-    
     payload = await request.json()
     response = await engine.process_request(payload)
-    
     if response:
         await manager.get_queue(session_id).put(response)
     return {"status": "accepted"}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    # Avvio con log massimi per debug
+    logger.info("🏁 [FINAL] Avvio server Uvicorn...")
+    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
