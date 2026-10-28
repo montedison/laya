@@ -3,3 +3,4 @@ laya[serve,mcp]
 fastapi
 uvicorn
 mcp
+pydantic
