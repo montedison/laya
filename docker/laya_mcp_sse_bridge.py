@@ -20,25 +20,26 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s │ %(levelname)-8s │ %(message)s")
 logger = logging.getLogger("LayaBridge")
 
-# --- MCP PROTOCOL ENGINE (The Missing Piece) ---
+# --- 🧠 MCP PROTOCOL ENGINE (Il vero cervello) ---
 
 class MCPProtocolEngine:
     """
-    Simula il comportamento di un server MCP reale.
-    Risponde automaticamente alle richieste di handshake e gestione sessione.
+    Questo motore trasforma le richieste del client in risposte valide.
+    È ciò che trasforma un 'Eco' in un 'Server reale'.
     """
     @staticmethod
-    async def generate_response(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    async def process_request(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         method = payload.get("method")
-        params = payload.get("params", {})
+        request_id = payload.get("id")
 
-        # 1. Gestione Handshake: Initialize
+        # 1. HANDSHAKE: Il client dice "initialize"
         if method == "initialize":
+            logger.info(f"🤝 Handshake 'initialize' ricevuto (ID: {request_id})")
             return {
                 "jsonrpc": "2.0",
-                "id": payload.get("id"),
+                "id": request_id,
                 "result": {
-                    "protocolVersion": "2024-11-05", # Versione standard MCP
+                    "protocolVersion": "2024-11-05",
                     "capabilities": {
                         "tools": {},
                         "resources": {},
@@ -51,37 +52,34 @@ class MCPProtocolEngine:
                 }
             }
 
-        # 2. Gestione Handshake: Initialized notification
-        # (In MCP, dopo 'initialize', il client invia una notifica 'initialized')
-        # Non richiede risposta, quindi lo ignoriamo qui.
-        if method == "notifications/initialized":
-            return None
-
-        # 3. Gestione: List Tools (Richiesta cruciale per Unsloth)
+        # 2. DISCOVERY: Il client dice "tools/list"
         if method == "tools/list":
+            logger.info(f"🔍 Richiesta 'tools/list' ricevuta (ID: {request_id})")
             return {
                 "jsonrpc": "2.0",
-                "id": payload.get("id"),
+                "id": request_id,
                 "result": {
                     "tools": [
                         {
                             "name": "laya_health_check",
-                            "description": "Verifica la salute del bridge Laya",
+                            "description": "Verifica la salute del bridge Laya (Test Tool)",
                             "inputSchema": {"type": "object", "properties": {}}
                         }
                     ]
                 }
             }
 
-        # 4. Gestione: Ping
+        # 3. PING: Il client verifica la latenza
         if method == "ping":
+            logger.info(f"⏱️ Ping ricevuto (ID: {request_id})")
             return {
                 "jsonrpc": "2.0",
-                "id": payload.get("id"),
+                "id": request_id,
                 "result": None
             }
 
-        # Se non conosciamo il metodo, non rispondere (lascia che il client gestisca il timeout)
+        # Se non conosciamo il metodo, non rispondiamo (lasciamo che il client gestisca il timeout)
+        logger.warning(f"❓ Metodo sconosciuto ricevuto: {method}")
         return None
 
 # --- SESSION MANAGEMENT ---
@@ -114,12 +112,14 @@ async def sse_generator(session_id: str):
     if not queue: return
 
     try:
+        # Handshake iniziale per Unsloth
         endpoint_url = f"/mcp?session_id={session_id}"
         yield f"event: endpoint\ndata: {endpoint_url}\n\n"
 
         while True:
-            message = await queue.get()
-            yield f"data: {json.dumps(message)}\n\n"
+            # Invia al client la RISPOSTA generata dal motore
+            response_payload = await queue.get()
+            yield f"data: {json.dumps(response_payload)}\n\n"
             queue.task_done()
     except asyncio.CancelledError:
         pass
@@ -142,21 +142,20 @@ async def mcp_endpoint(request: Request, session_id: str = Query(None)):
 
     try:
         payload = await request.json()
-        logger.info(f"📥 Request: {payload.get('method')} | Session: {session_id}")
-
-        # --- LOGICA DI RISPOSTA AUTOMATICA ---
-        # Invece di limitarsi a mettere in coda, generiamo la risposta corretta
-        response = await engine.generate_response(payload)
         
-        queue = manager.get_queue(session_id)
+        # --- IL CAMBIO FONDAMENTALE ---
+        # Invece di mettere in coda la richiesta (payload), 
+        # mettiamo in coda la RISPOSTA generata dal motore.
+        response = await engine.process_request(payload)
+        
         if response:
-            # Inseriamo la risposta nella coda per inviarla al client via SSE
-            await queue.put(response)
+            logger.info(f"📤 Generata risposta per {payload.get('method')} (ID: {payload.get('id')})")
+            await manager.get_queue(session_id).put(response)
         
-        return {"status": "processed"}
+        return {"status": "accepted"}
     except Exception as e:
-        logger.error(f"❌ Error: {str(e)}")
+        logger.error(f"❌ Errore nel processamento POST: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == "__main__":
+if __name__ == "__main__':
     uvicorn.run(app, host="0.0.0.0", port=8001)
