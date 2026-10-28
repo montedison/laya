@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import uuid
+import importlib
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request, HTTPException, Query
@@ -20,142 +21,152 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s │ %(levelname)-8s │ %(message)s")
 logger = logging.getLogger("LayaBridge")
 
-# --- 🧠 MCP PROTOCOL ENGINE (Il vero cervello) ---
+# --- 🧠 REAL MCP PROTOCOL ENGINE ---
 
 class MCPProtocolEngine:
-    """
-    Questo motore trasforma le richieste del client in risposte valide.
-    È ciò che trasforma un 'Eco' in un 'Server reale'.
-    """
-    @staticmethod
-    async def process_request(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def __init__(self):
+        self.laya_tools_module = None
+
+    def _load_laya_tools(self):
+        """Tenta di caricare dinamicamente i tool reali da laya.mcp.tools."""
+        if self.laya_tools_module is None:
+            try:
+                # Tentativo di importazione del modulo reale trovato nell'analisi del zip
+                self.laya_tools_module = importlib.import_module("laya.mcp.tools")
+                logger.info("✅ Modulo 'laya.mcp.tools' caricato con successo. Tool reali pronti.")
+            except ImportError as e:
+                logger.error(f"❌ Impossibile caricare i tool di Laya: {e}. Uso tool di fallback.")
+                self.laya_tools_module = None
+        return self.laya_tools_module
+
+    async def process_request(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         method = payload.get("method")
         request_id = payload.get("id")
 
-        # 1. HANDSHAKE: Il client dice "initialize"
+        # 1. HANDSHAKE: Initialize
         if method == "initialize":
-            logger.info(f"🤝 Handshake 'initialize' ricevuto (ID: {request_id})")
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
                     "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {},
-                        "resources": {},
-                        "logging": {}
-                    },
-                    "serverInfo": {
-                        "name": "laya-mcp-bridge",
-                        "version": "1.0.0"
-                    }
+                    "capabilities": {"tools": {}, "resources": {}, "logging": {}},
+                    "serverInfo": {"name": "laya-mcp-bridge", "version": "1.0.0"}
                 }
             }
 
-        # 2. DISCOVERY: Il client dice "tools/list"
+        # 2. DISCOVERY: tools/list
         if method == "tools/list":
-            logger.info(f"🔍 Richiesta 'tools/list' ricevuta (ID: {request_id})")
+            tools = self._get_tools_list()
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {
-                    "tools": [
-                        {
-                            "name": "laya_health_check",
-                            "description": "Verifica la salute del bridge Laya (Test Tool)",
-                            "inputSchema": {"type": "object", "properties": {}}
-                        }
-                    ]
-                }
+                "result": {"tools": tools}
             }
 
-        # 3. PING: Il client verifica la latenza
-        if method == "ping":
-            logger.info(f"⏱️ Ping ricevuto (ID: {request_id})")
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": None
-            }
+        # 3. EXECUTION: tools/call (Il cuore del sistema)
+        if method == "tools/call":
+            return await self._handle_tool_call(payload)
 
-        # Se non conosciamo il metodo, non rispondiamo (lasciamo che il client gestisca il timeout)
-        logger.warning(f"❓ Metodo sconosciuto ricevuto: {method}")
+        # 4. NOTIFICATIONS/PING (Ignorati o risposti con successo)
+        if method in ["notifications/initialized", "ping"]:
+            return None
+
+        logger.warning(f"❓ Metodo sconosciuto: {method}")
         return None
 
-# --- SESSION MANAGEMENT ---
+    def _get_tools_list(self) -> list:
+        """Genera la lista dei tool. Se Laya è caricato, usa i suoi; altrimenti fallback."""
+        module = self._load_laya_tools()
+        if module and hasattr(module, "get_tools"):
+            # Assumiamo che Laya abbia una funzione standard per elencare i tool
+            return module.get_tools()
+        
+        # Fallback per test se il modulo non è caricabile
+        return [{
+            "name": "laya_health_check",
+            "description": "Check Laya Bridge status",
+            "inputSchema": {"type": "object", "properties": {}}
+        }]
+
+    async def _handle_tool_call(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Esegue la funzione Python reale corrispondente al tool richiesto."""
+        name = payload.get("params", {}).get("name")
+        args = payload.get("params", {}).get("arguments", {})
+        request_id = payload.get("id")
+
+        module = self._load_laya_tools()
+        
+        try:
+            if module and hasattr(module, "call_tool"):
+                # Chiamata al motore reale di Laya
+                result = await module.call_tool(name, args)
+                return {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {"content": [{"type": "text", "text": str(result)}]}
+                }
+            else:
+                # Fallback se il modulo non è presente
+                raise Exception("Laya tool module not available for execution")
+
+        except Exception as e:
+            logger.error(f"❌ Errore nell'esecuzione del tool '{name}': {str(e)}")
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": f"Tool execution failed: {str(e)}"
+                }
+            }
+
+# --- SESSION & APP (Identici alla versione precedente per stabilità) ---
 
 class SessionManager:
     def __init__(self):
         self.sessions: Dict[str, asyncio.Queue] = {}
-
     def create_session(self) -> str:
-        session_id = str(uuid.uuid4())
-        self.sessions[session_id] = asyncio.Queue()
-        logger.info(f"🆕 Sessione creata: {session_id}")
-        return session_id
-
-    def get_queue(self, session_id: str) -> Optional[asyncio.Queue]:
-        return self.sessions.get(session_id)
-
-    def delete_session(self, session_id: str):
-        if session_id in self.sessions:
-            del self.sessions[session_id]
-            logger.info(f"🗑️ Sessione rimossa: {session_id}")
+        sid = str(uuid.uuid4())
+        self.sessions[sid] = asyncio.Queue()
+        return sid
+    def get_queue(self, sid: str) -> Optional[asyncio.Queue]:
+        return self.sessions.get(sid)
+    def delete_session(self, sid: str):
+        self.sessions.pop(sid, None)
 
 manager = SessionManager()
 engine = MCPProtocolEngine()
-
-# --- CORE LOGIC ---
+app = FastAPI()
 
 async def sse_generator(session_id: str):
     queue = manager.get_queue(session_id)
     if not queue: return
-
+    yield f"event: endpoint\ndata: /mcp?session_id={session_id}\n\n"
     try:
-        # Handshake iniziale per Unsloth
-        endpoint_url = f"/mcp?session_id={session_id}"
-        yield f"event: endpoint\ndata: {endpoint_url}\n\n"
-
         while True:
-            # Invia al client la RISPOSTA generata dal motore
-            response_payload = await queue.get()
-            yield f"data: {json.dumps(response_payload)}\n\n"
+            msg = await queue.get()
+            yield f"data: {json.dumps(msg)}\n\n"
             queue.task_done()
-    except asyncio.CancelledError:
-        pass
-    finally:
-        manager.delete_session(session_id)
-
-# --- ENDPOINTS ---
-
-app = FastAPI()
+    except asyncio.CancelledError: pass
+    finally: manager.delete_session(session_id)
 
 @app.get("/sse")
 async def sse_endpoint(request: Request):
-    session_id = manager.create_session()
-    return StreamingResponse(sse_generator(session_id), media_type="text/event-stream")
+    return StreamingResponse(sse_generator(manager.create_session()), media_type="text/event-stream")
 
 @app.post("/mcp")
 async def mcp_endpoint(request: Request, session_id: str = Query(None)):
     if not session_id or not manager.get_queue(session_id):
         raise HTTPException(status_code=400, detail="Invalid Session")
-
-    try:
-        payload = await request.json()
-        
-        # --- IL CAMBIO FONDAMENTALE ---
-        # Invece di mettere in coda la richiesta (payload), 
-        # mettiamo in coda la RISPOSTA generata dal motore.
-        response = await engine.process_request(payload)
-        
-        if response:
-            logger.info(f"📤 Generata risposta per {payload.get('method')} (ID: {payload.get('id')})")
-            await manager.get_queue(session_id).put(response)
-        
-        return {"status": "accepted"}
-    except Exception as e:
-        logger.error(f"❌ Errore nel processamento POST: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+    
+    payload = await request.json()
+    response = await engine.process_request(payload)
+    
+    if response:
+        await manager.get_queue(session_id).put(response)
+    
+    return {"status": "accepted"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001)
