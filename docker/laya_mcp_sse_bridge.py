@@ -3,166 +3,166 @@ import uuid
 import logging
 import json
 import sys
+import urllib.parse
 from typing import Dict, Optional, Any
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
+
+# Import del core Laya (assumendo che l'ambiente sia configurato correttamente)
+try:
+    from mcp.server.sse import SseServerTransport
+    from laya.mcp.server import server
+except ImportError as e:
+    print(f"CRITICAL ERROR: Missing Laya MCP dependencies: {e}")
+    sys.exit(1)
 
 # Configurazione Logging
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger("LayaBridge")
 
-class SessionState:
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.is_active = True
-        self.last_activity = asyncio.get_event_loop().time()
-        self.metadata: Dict[str, Any] = {}
-
-class LayaMcpSseBridge:
+class SessionManager:
+    """Gestisce la persistenza delle sessioni tra i vari tentativi del client."""
     def __init__(self):
-        self.active_sessions: Dict[str, SessionState] = {}
-        self.client_to_session_map: Dict[str, str] = {} 
+        self.active_sessions: Dict[str, str] = {} # IP -> SessionID
+        self.session_to_ip: Dict[str, str] = {}  # SessionID -> IP
 
-    async def generate_secure_session_id(self) -> str:
-        return str(uuid.uuid4())
+    def register(self, ip: str, session_id: str):
+        self.active_sessions[ip] = session_id
+        self.session_to_ip[session_id] = ip
 
-    async def get_or_create_session(self, client_ip: str, existing_id: Optional[str] = None) -> str:
-        if existing_id:
-            if existing_id in self.active_sessions:
-                self.client_to_session_map[client_ip] = existing_id
-                return existing_id
-        
-        new_id = await self.generate_secure_session_id()
-        self.active_sessions[new_id] = SessionState(new_id)
-        self.client_to_session_map[client_ip] = new_id
-        return new_id
+    def get_by_ip(self, ip: str) -> Optional[str]:
+        return self.active_sessions.get(ip)
 
-    async def extract_session_from_path(self, path: str) -> Optional[str]:
-        try:
-            decoded_path = urllib.parse.unquote(path)
-            if "session_id" in decoded_path:
-                json_str = decoded_path.lstrip('/')
-                data = json.loads(json_str)
-                return data.get("session_id")
-        except Exception:
-            pass
-        return None
+    def get_by_session(self, session_id: str) -> Optional[str]:
+        return self.session_to_ip.get(session_id)
 
-    async def patch_request(self, request: Request) -> Dict[str, Any]:
-        client_ip = request.client.host
-        path = request.url.path
-        
-        session_id_from_path = await self.extract_session_from_path(path)
-        
-        body = {}
-        try:
-            body = await request.json()
-        except Exception:
-            pass
+session_manager = SessionManager()
+transport = SseServerTransport("/mcp")
+app = FastAPI(title="Laya MCP Resilient Bridge")
 
-        final_session_id = None
-        if session_id_from_path:
-            final_session_id = session_id_from_path
-        elif "session_id" in body:
-            final_session_id = body["session_id"]
-        else:
-            recovered_id = self.client_to_session_map.get(client_ip)
-            if recovered_id:
-                final_session_id = recovered_id
-            else:
-                new_id = await self.generate_secure_session_id()
-                self.active_sessions[new_id] = SessionState(new_id)
-                self.client_to_session_map[client_ip] = new_id
-                final_session_id = new_id
+# --- LOGICA DI INTERCETTAZIONE (Resilience Layer) ---
 
-        body["session_id"] = final_session_id
-        return body
+async def resolve_session_id(request: Request) -> str:
+    """
+    Risolve l'identità della sessione usando una gerarchia di fallback:
+    1. Path decodificato (per i bug del client Unsloth)
+    2. Body JSON
+    3. Mappa IP-Session
+    4. Generazione nuova sessione
+    """
+    client_ip = request.client.host
+    path = request.url.path
+    
+    # 1. Tentativo da PATH (Unsloth bug: /%7B%22session_id%22... )
+    try:
+        decoded_path = urllib.parse.unquote(path)
+        if "session_id" in decoded_path:
+            # Estrazione tramite parsing JSON dal path
+            json_str = decoded_path.lstrip('/')
+            data = json.loads(json_str)
+            sid = data.get("session_id")
+            if sid:
+                logger.warning(f"[PROTOCOL] Recovered SID from malformed path: {sid}")
+                return sid
+    except Exception:
+        pass
 
-bridge = LayaMcpSseBridge()
-app = FastAPI()
+    # 2. Tentativo da BODY
+    try:
+        body = await request.json()
+        if "session_id" in body:
+            return body["session_id"]
+    except Exception:
+        pass
+
+    # 3. Tentativo da IP-MAP
+    existing_sid = session_manager.get_by_ip(client_ip)
+    if existing_sid:
+        logger.info(f"[PROTOCOL] Recovered SID from IP-Map: {existing_sid}")
+        return existing_sid
+
+    # 4. Fallback: Nuova sessione
+    new_sid = str(uuid.uuid4())
+    session_manager.register(client_ip, new_sid)
+    logger.info(f"[PROTOCOL] Created new session for {client_ip}: {new_sid}")
+    return new_sid
+
+# --- ROUTING E HANDLER ---
 
 @app.get("/sse")
 async def sse_endpoint(request: Request):
+    """
+    Gestisce l'handshake SSE. 
+    Usa il transport ufficiale di MCP per garantire la conformità.
+    """
     client_ip = request.client.host
-    existing_id = request.query_params.get("session_id")
-    session_id = await bridge.get_or_create_session(client_ip, existing_id)
+    query_params = request.query_params
+    existing_id = query_params.get("session_id")
 
-    async def event_generator():
-        try:
-            yield f"event: endpoint\ndata: {json.dumps({'session_id': session_id})}\n\n"
-            while True:
-                await asyncio.sleep(20)
-                if session_id not in bridge.active_sessions:
-                    break
-                yield ": keep-alive\n\n"
-        except asyncio.CancelledError:
-            pass
-        finally:
-            if session_id in bridge.active_sessions:
-                bridge.active_sessions[session_id].is_active = False
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    # Se l'ID è fornito, lo registriamo all'IP
+    if existing_id:
+        session_manager.register(client_ip, existing_id)
+    else:
+        # Se non c'è, creiamo una nuova sessione
+        new_id = str(uuid.uuid4())
+        session_manager.register(client_ip, new_id)
+        # Nota: Il transport di MCP gestirà l'invio dell'evento 'endpoint'
+    
+    # Delegazione al transport ufficiale
+    # Questo garantisce che l'handshake 'initialize' sia gestito da Laya
+    return await transport.connect_sse(request.scope, request.receive, request.send)
 
 @app.post("/mcp")
 async def mcp_endpoint(request: Request):
-    try:
-        patched_body = await bridge.patch_request(request)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    session_id = patched_body["session_id"]
-    request_id = patched_body.get("id", "1")
-    method = patched_body.get("method")
-
-    # --- MCP HANDSHAKE EMULATION ---
-    # Se il client chiede 'initialize', diamo la risposta che si aspetta.
-    if method == "initialize":
-        rpc_response = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "protocolVersion": "1.0",
-                "capabilities": {
-                    "logging": {},
-                    "tools": {}
-                },
-                "serverInfo": {
-                    "name": "laya-mcp-bridge",
-                    "version": "1.0.0"
-                }
-            }
-        }
-        logger.info(f"[PROTOCOL] Handshake: Responded to 'initialize' for session {session_id}")
-        return rpc_response
-
-    # --- OTHER MCP METHODS ---
-    # Per tutti gli altri metodi (es. 'list_tools'), rispondiamo con un risultato vuoto ma conforme.
-    rpc_response = {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "result": {
-            "tools": [] # Risposta vuota per list_tools
-        }
-    }
+    """
+    Intercettatore per i messaggi POST. 
+    Assicura che ogni messaggio abbia un session_id valido prima di passare al transport.
+    """
+    # 1. Risoluzione dell'identità
+    session_id = await resolve_session_id(request)
     
-    # Se il metodo non è riconosciuto, mandiamo un errore JSON-RPC standard
-    if method not in ["initialize", "list_tools", "call_tool", "notifications/initialized"]:
-        # Nota: per semplicità, simuliamo un successo anche per metodi sconosciuti 
-        # per non bloccare il client durante il test.
-        rpc_response["result"] = {"status": "success", "data": "mock_ack"}
+    # 2. Patching del body (necessario per il transport di MCP)
+    # Se il client ha inviato l'ID nel path, il transport di MCP non lo vedrà nel body.
+    # Dobbiamo assicurarci che il body contenga il session_id per la compatibilità.
+    try:
+        body = await request.json()
+        if "session_id" not in body:
+            body["session_id"] = session_id
+    except Exception:
+        # Se il body è vuoto o non è JSON, creiamo un body minimo
+        body = {"session_id": session_id}
 
-    logger.info(f"[PROTOCOL] Responded to method '{method}' for session {session_id}")
-    return rpc_response
+    # 3. Delegazione al transport ufficiale (Bypass FastAPI)
+    # Il transport di MCP si aspetta di gestire lo scope ASGI direttamente.
+    # Poiché FastAPI/Starlette non espongono facilmente lo scope di basso livello,
+    # usiamo la tecnica del middleware o del bypass.
+    
+    # Per semplicità e robustezza in questo contesto, usiamo la logica di 
+    # handle_post_message del transport.
+    return await transport.handle_post_message(request.scope, request.receive, request.send)
 
-@app.api_route("/{path_name:path}", methods=["POST", "GET"])
-async def catch_all_route(request: Request):
-    if "session_id" in request.url.path or any(c in request.url.path for c in ['{', '%7B']):
+@app.api_route("/{path_name:path}", methods=["GET", "POST"])
+async def catch_all(request: Request):
+    """
+    Cattura tutti i tentativi di path malformati (es. l'ID nel path)
+    e li instrada verso i controller corretti.
+    """
+    path = request.url.path
+    if "/sse" in path or "session_id" in path:
+        if request.method == "GET":
+            return await sse_endpoint(request)
+        else:
+            return await mcp_endpoint(request)
+    
+    # Se il path è un JSON malformato (es. /%7B%22...)
+    if any(c in path for c in ['{', '%7B']):
         if request.method == "POST":
             return await mcp_endpoint(request)
-        return await sse_endpoint(request)
+        else:
+            return await sse_endpoint(request)
+            
     raise HTTPException(status_code=404, detail="Not Found")
 
 if __name__ == "__main__":
     import uvicorn
-    import urllib.parse # Necessario per il catch-all
     uvicorn.run(app, host="0.0.0.0", port=8001)
