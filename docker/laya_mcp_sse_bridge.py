@@ -3,6 +3,7 @@ import logging
 import sys
 import json
 import asyncio
+import uuid  # <--- AGGIUNTO
 from datetime import datetime
 from contextvars import ContextVar
 from typing import Any, Callable, Dict, Tuple, Optional
@@ -27,9 +28,9 @@ handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(DiagnosticFormatter())
 logger.addHandler(handler)
 
-# --- SESSION TRACKING (The "Unsloth Fix") ---
+# --- SESSION TRACKING (The Ultimate Fix) ---
 class SessionTracker:
-    """Mantiene traccia dell'ultimo session_id valido per riparare i POST di Unsloth."""
+    """Mantiene traccia dell'ultimo session_id per riparare i POST di Unsloth."""
     def __init__(self):
         self.last_session_id: Optional[str] = None
 
@@ -67,12 +68,9 @@ class LayaPrimitiveMiddleware:
             
             # --- FIX: POST BYPASS & SESSION RECOVERY ---
             if (path.startswith("/mcp") or path.startswith("/message")) and scope["method"] == "POST":
-                # Se Unsloth invia un POST senza session_id, lo iniettiamo noi
                 if "session_id=" not in query and session_tracker.get():
                     recovered_id = session_tracker.get()
                     logger.warning(f"[PROTOCOL] Unsloth sent POST without session_id. Recovering: {recovered_id}")
-                    
-                    # Modifica lo scope per includere il session_id recuperato
                     new_query = f"session_id={recovered_id}"
                     scope["query_string"] = new_query.encode("utf-8")
                     logger.info(f"[PROTOCOL] Successfully patched request with session_id={recovered_id}")
@@ -103,6 +101,23 @@ async def handle_sse_logic(scope, receive, send):
     """Handles the GET /sse handshake with Wrapped Send Injection."""
     logger.info("[SSE] Handshake attempt via GET /sse")
     
+    # 1. GENERAZIONE ANTICIPATA DEL SESSION ID
+    # Estraiamo l'ID se presente, altrimenti ne creiamo uno nuovo immediatamente.
+    # Questo garantisce che il bridge abbia un ID prima ancora che il transport inizi.
+    query = scope.get("query_string", b"").decode("utf-8")
+    session_id = ""
+    if "session_id=" in query:
+        session_id = query.split("session_id=")[-1].split("&")[0]
+    
+    if not session_id:
+        logger.info("[SSE] No session_id in GET /sse. Generating a new one to force synchronization.")
+        session_id = uuid.uuid4().hex
+        # Nota: Non possiamo modificare lo scope di una richiesta già in corso per il transport, 
+        # ma lo useremo per l'annuncio e per il tracker.
+    
+    session_tracker.update(session_id)
+    logger.info(f"[SSE] Active Session ID for this connection: {session_id}")
+
     endpoint_sent = False
 
     async def wrapped_send(message):
@@ -110,19 +125,9 @@ async def handle_sse_logic(scope, receive, send):
         if message["type"] == "http.response.start":
             await send(message)
             if not endpoint_sent:
-                # Estraiamo il session_id dallo scope della connessione SSE
-                query = scope.get("query_string", b"").decode("utf-8")
-                session_id = ""
-                if "session_id=" in query:
-                    session_id = query.split("session_id=")[-1].split("&")[0]
-                
-                if session_id:
-                    session_tracker.update(session_id)
-                
                 logger.info(f"[SSE] Injecting 'endpoint' event. Session ID: {session_id}")
-                
-                # Invia l'endpoint completo con il session_id
-                full_endpoint = f"{MESSAGING_ENDPOINT}?session_id={session_id}" if session_id else MESSAGING_ENDPOINT
+                # Annunciamo l'endpoint COMPLETO con il session_id
+                full_endpoint = f"{MESSAGING_ENDPOINT}?session_id={session_id}"
                 endpoint_payload = f"event: endpoint\ndata: {full_endpoint}\n\n".encode("utf-8")
                 
                 await send({
@@ -135,7 +140,18 @@ async def handle_sse_logic(scope, receive, send):
             await send(message)
 
     try:
-        async with transport.connect_sse(scope, receive, wrapped_send) as (read_stream, write_stream):
+        # Usiamo lo scope modificato per assicurarci che il transport veda lo stesso session_id
+        #        che abbiamo appena generato/estratto.
+        modified_scope = dict(scope)
+        if session_id:
+            # Inseriamo il session_id nello scope per il transport
+            if "query_string" in modified_scope:
+                new_query = f"session_id={session_id}" if not modified_scope["query_string"].decode("utf-8").startswith("session_id=") else modified_scope["query_string"].decode("utf-8")
+                modified_scope["query_string"] = new_query.encode("utf-8")
+            else:
+                modified_scope["query_string"] = f"session_id={session_id}".encode("utf-8")
+
+        async with transport.connect_sse(modified_scope, receive, wrapped_send) as (read_stream, write_stream):
             logger.info("[SSE] SSE connection established via wrapped_send. Starting run loop.")
             try:
                 from mcp.types import InitializationOptions
@@ -160,7 +176,7 @@ async def sse_endpoint(request: Request):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "bridge": "robust_recovery_v2"}
+    return {"status": "ok", "bridge": "robust_session_recovery_v3"}
 
 if __name__ == "__main__":
     import uvicorn
