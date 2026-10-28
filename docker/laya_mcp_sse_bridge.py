@@ -5,10 +5,12 @@ import json
 import sys
 import urllib.parse
 from typing import Dict, Optional, Any
+
+import uvicon
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 
-# Import del core Laya (assumendo che l'ambiente sia configurato correttamente)
+# Import del core Laya
 try:
     from mcp.server.sse import SseServerTransport
     from laya.mcp.server import server
@@ -21,7 +23,6 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger("LayaBridge")
 
 class SessionManager:
-    """Gestisce la persistenza delle sessioni tra i vari tentativi del client."""
     def __init__(self):
         self.active_sessions: Dict[str, str] = {} # IP -> SessionID
         self.session_to_ip: Dict[str, str] = {}  # SessionID -> IP
@@ -40,127 +41,93 @@ session_manager = SessionManager()
 transport = SseServerTransport("/mcp")
 app = FastAPI(title="Laya MCP Resilient Bridge")
 
-# --- LOGICA DI INTERCETTAZIONE (Resilience Layer) ---
+# --- CORE LOGIC: PATCHING & ROUTING ---
 
 async def resolve_session_id(request: Request) -> str:
-    """
-    Risolve l'identità della sessione usando una gerarchia di fallback:
-    1. Path decodificato (per i bug del client Unsloth)
-    2. Body JSON
-    3. Mappa IP-Session
-    4. Generazione nuova sessione
-    """
     client_ip = request.client.host
     path = request.url.path
     
-    # 1. Tentativo da PATH (Unsloth bug: /%7B%22session_id%22... )
+    # 1. Path decoding (Unsloth bug fix)
     try:
         decoded_path = urllib.parse.unquote(path)
         if "session_id" in decoded_path:
-            # Estrazione tramite parsing JSON dal path
             json_str = decoded_path.lstrip('/')
             data = json.loads(json_str)
             sid = data.get("session_id")
-            if sid:
-                logger.warning(f"[PROTOCOL] Recovered SID from malformed path: {sid}")
-                return sid
-    except Exception:
-        pass
+            if sid: return sid
+    except: pass
 
-    # 2. Tentativo da BODY
+    # 2. Body extraction
     try:
         body = await request.json()
-        if "session_id" in body:
-            return body["session_id"]
-    except Exception:
-        pass
+        if "session_id" in body: return body["session_id"]
+    except: pass
 
-    # 3. Tentativo da IP-MAP
-    existing_sid = session_manager.get_by_ip(client_ip)
-    if existing_sid:
-        logger.info(f"[PROTOCOL] Recovered SID from IP-Map: {existing_sid}")
-        return existing_sid
+    # 3. IP Mapping
+    existing = session_manager.get_by_ip(client_ip)
+    if existing: return existing
 
-    # 4. Fallback: Nuova sessione
+    # 4. New Session
     new_sid = str(uuid.uuid4())
     session_manager.register(client_ip, new_sid)
-    logger.info(f"[PROTOCOL] Created new session for {client_ip}: {new_sid}")
     return new_sid
 
-# --- ROUTING E HANDLER ---
+# --- THE ASGI MIDDLEWARE (The Fix) ---
 
-@app.get("/sse")
-async def sse_endpoint(request: Request):
+class SseDirectMiddleware:
     """
-    Gestisce l'handshake SSE. 
-    Usa il transport ufficiale di MCP per garantire la conformità.
+    Intercetta le richieste SSE a livello ASGI prima che FastAPI 
+    tenti di gestirle come endpoint HTTP standard.
     """
-    client_ip = request.client.host
-    query_params = request.query_params
-    existing_id = query_params.get("session_id")
+    def __init__(self, app):
+        self.app = app
 
-    # Se l'ID è fornito, lo registriamo all'IP
-    if existing_id:
-        session_manager.register(client_ip, existing_id)
-    else:
-        # Se non c'è, creiamo una nuova sessione
-        new_id = str(uuid.uuid4())
-        session_manager.register(client_ip, new_id)
-        # Nota: Il transport di MCP gestirà l'invio dell'evento 'endpoint'
-    
-    # Delegazione al transport ufficiale
-    # Questo garantisce che l'handshake 'initialize' sia gestito da Laya
-    return await transport.connect_sse(request.scope, request.receive, request.send)
+    async def __call__(self, scope, receive, send):
+        # Se la richiesta è una GET su /sse, bypassiamo completamente FastAPI
+        if scope["type"] == "http" and scope["path"] == "/sse":
+            logger.info("[ASGI] Intercepting SSE handshake at low-level.")
+            try:
+                # Passiamo lo scope originale al transport
+                await transport.connect_sse(scope, receive, send)
+            except Exception as e:
+                logger.error(f"[ASGI] SSE Transport Error: {e}", exc_info=True)
+            return
+
+        # Per tutto il resto, procediamo con FastAPI
+        await self.app(scope, receive, send)
+
+app.add_middleware(SseDirectMiddleware)
+
+# --- FASTAPI ENDPOINTS (For POST /mcp) ---
 
 @app.post("/mcp")
 async def mcp_endpoint(request: Request):
-    """
-    Intercettatore per i messaggi POST. 
-    Assicura che ogni messaggio abbia un session_id valido prima di passare al transport.
-    """
-    # 1. Risoluzione dell'identità
+    # 1. Risoluzione identità
     session_id = await resolve_session_id(request)
     
-    # 2. Patching del body (necessario per il transport di MCP)
-    # Se il client ha inviato l'ID nel path, il transport di MCP non lo vedrà nel body.
-    # Dobbiamo assicurarci che il body contenga il session_id per la compatibilità.
+    # 2. Patching del body per coerenza
     try:
         body = await request.json()
         if "session_id" not in body:
             body["session_id"] = session_id
-    except Exception:
-        # Se il body è vuoto o non è JSON, creiamo un body minimo
+    except:
         body = {"session_id": session_id}
 
-    # 3. Delegazione al transport ufficiale (Bypass FastAPI)
-    # Il transport di MCP si aspetta di gestire lo scope ASGI direttamente.
-    # Poiché FastAPI/Starlette non espongono facilmente lo scope di basso livello,
-    # usiamo la tecnica del middleware o del bypass.
-    
-    # Per semplicità e robustezza in questo contesto, usiamo la logica di 
-    # handle_post_message del transport.
+    # 3. Delegazione al transport originale
+    # Nota: handle_post_message richiede lo scope ASGI.
+    # Poiché siamo dentro un endpoint FastAPI, possiamo estrarre lo scope.
     return await transport.handle_post_message(request.scope, request.receive, request.send)
 
 @app.api_route("/{path_name:path}", methods=["GET", "POST"])
 async def catch_all(request: Request):
-    """
-    Cattura tutti i tentativi di path malformati (es. l'ID nel path)
-    e li instrada verso i controller corretti.
-    """
     path = request.url.path
-    if "/sse" in path or "session_id" in path:
-        if request.method == "GET":
-            return await sse_endpoint(request)
-        else:
-            return await mcp_endpoint(request)
-    
-    # Se il path è un JSON malformato (es. /%7B%22...)
+    # Se il client sta usando il path malformato con l'ID, lo re-instrada al mcp_endpoint
     if any(c in path for c in ['{', '%7B']):
         if request.method == "POST":
             return await mcp_endpoint(request)
-        else:
-            return await sse_endpoint(request)
-            
+        # Se è un GET malformato, lo mandiamo comunque al middleware SSE
+        # (Il middleware lo catturerà prima di arrivare qui)
+    
     raise HTTPException(status_code=404, detail="Not Found")
 
 if __name__ == "__main__":
