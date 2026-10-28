@@ -4,3 +4,4 @@ fastapi
 uvicorn
 mcp
 pydantic
+typing
