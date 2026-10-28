@@ -3,7 +3,7 @@ import uuid
 import logging
 import json
 import sys
-import urllib.parse  # Per decodificare i path malformati
+import urllib.parse
 from typing import Dict, Optional, Any
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
@@ -28,68 +28,66 @@ class LayaMcpSseBridge:
         return str(uuid.uuid4())
 
     async def get_or_create_session(self, client_ip: str, existing_id: Optional[str] = None) -> str:
+        # 1. Se l'ID esiste già, usalo
         if existing_id:
             if existing_id in self.active_sessions:
+                self.client_to_session_map[client_ip] = existing_id
                 return existing_id
         
+        # 2. Se l'ID è nel path (decodificato) o non esiste, creane uno nuovo
         new_id = await self.generate_secure_session_id()
         self.active_sessions[new_id] = SessionState(new_id)
         self.client_to_session_map[client_ip] = new_id
+        logger.info(f"[SSE] Session Created/Assigned: {new_id} for {client_ip}")
         return new_id
 
-    async def extract_session_from_path(self, path: str) -> Optional[str]:
-        """
-        DEFESA 1: Estrae l'ID anche se il client lo invia come path URL-encoded.
-        Esempio: /%7B%22session_id%22%3A%20%22uuid%22%7D -> uuid
-        """
-        try:
-            decoded_path = urllib.parse.unquote(path)
-            # Se il path contiene un JSON string, proviamo a parsarlo
-            if "session_id" in decoded_path:
-                # Pulizia del path per isolare il JSON (rimuovendo eventuali prefissi '/')
-                json_str = decoded_path.lstrip('/')
-                data = json.loads(json_str)
-                return data.get("session_id")
-        except Exception:
-            return None
-        return None
-
     async def patch_request(self, request: Request) -> Dict[str, Any]:
-        """
-        DEFESA 2: Orchestrazione del recupero identità.
-        """
         client_ip = request.client.host
         path = request.url.path
         
-        # 1. Tentativo di estrazione dal PATH (per i client malformati)
-        session_id_from_path = await self.extract_session_from_path(path)
-        
-        # 2. Tentativo di estrazione dal BODY
+        # --- STEP 1: Estrazione ID dal PATH (per client malformati) ---
+        session_id_from_path = None
+        try:
+            decoded_path = urllib.parse.unquote(path)
+            if "session_id" in decoded_path:
+                json_str = decoded_path.lstrip('/')
+                data = json.loads(json_str)
+                session_id_from_path = data.get("session_id")
+        except Exception:
+            pass
+
+        # --- STEP 2: Estrazione ID dal BODY ---
         body = {}
         try:
             body = await request.json()
         except Exception:
             pass
 
-        # Logica di priorità per il session_id
+        # --- STEP 3: Logica di Determinazione Identità ---
         final_session_id = None
+        
         if session_id_from_path:
             final_session_id = session_id_from_path
             logger.warning(f"[PROTOCOL] Identity recovered from MALFORMED PATH: {final_session_id}")
         elif "session_id" in body:
             final_session_id = body["session_id"]
         else:
-            # 3. Fallback sulla mappa IP-Session
+            # Se non c'è nulla, cerchiamo la sessione associata all'IP
             recovered_id = self.client_to_session_map.get(client_ip)
             if recovered_id:
                 final_session_id = recovered_id
                 logger.warning(f"[PROTOCOL] Identity recovered from IP-MAP: {final_session_id}")
+            else:
+                # --- STEP 4: AGGRESSIVE RECOVERY (Il colpo di grazia al 403) ---
+                # Se il client è totalmente "orfano", non dare 403. Crea una sessione per lui.
+                logger.error(f"[PROTOCOL] Client {client_ip} is ORPHANED. Forcing new session creation.")
+                new_id = await self.generate_secure_session_id()
+                self.active_sessions[new_id] = SessionState(new_id)
+                self.client_to_session_map[client_ip] = new_id
+                final_session_id = new_id
+                logger.info(f"[PROTOCOL] Forced new session for orphaned client: {final_session_id}")
 
-        if not final_session_id or final_session_id not in self.active_sessions:
-            logger.error(f"[PROTOCOL] Identity Recovery Failed for {client_ip}. Path: {path}")
-            raise HTTPException(status_code=403, detail="No active session found")
-
-        # Inseriamo l'ID nel body per garantire la consistenza interna
+        # Inseriamo l'ID nel body per la coerenza interna
         body["session_id"] = final_session_id
         return body
 
@@ -114,25 +112,27 @@ async def sse_endpoint(request: Request):
             pass
         finally:
             if session_id in bridge.active_sessions:
+
                 bridge.active_sessions[session_id].is_active = False
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @app.post("/mcp")
 async def mcp_endpoint(request: Request):
-    # Gestione errori di patching
     try:
         patched_body = await bridge.patch_request(request)
-    except HTTPException as he:
-        raise he
     except Exception as e:
-        logger.error(f"[PROTOCOL] Critical Patch Error: {str(e)}")
-        raise HTTPException(status_code=400, detail="Invalid request context")
+        logger.error(f"[PROTOCOL] Patching failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
 
     session_id = patched_body["session_id"]
 
-    # Risposta JSON-RPC 2.0 conforme
+    if session_id not in bridge.active_sessions:
+        # Questo non dovrebbe più accadere grazie all'Aggressive Recovery
+        raise HTTPException(status_code=404, detail="Session not found")
+
     request_id = patched_body.get("id", "1")
+    
     rpc_response = {
         "jsonrpc": "2.0",
         "id": request_id,
@@ -142,25 +142,14 @@ async def mcp_endpoint(request: Request):
             "data": "MCP_ACK"
         }
     }
-
     logger.info(f"[PROTOCOL] Responded to session {session_id} via JSON-RPC 2.0")
     return rpc_response
 
-# Aggiungiamo un router per catturare i path malformati (es. /%7B%22...)
-# Questo evita il 404 e permette al nostro patch_request di agire
 @app.api_route("/{path_name:path}", methods=["POST", "GET"])
 async def catch_all_route(request: Request):
-    """
-    CATTURA TUTTO: Se il client invia un JSON nel path, questo router lo intercetta
-    e lo instrada verso la logica /mcp.
-    """
-    if "/mcp" in request.url.path or any(c in request.url.path for c in ['{', '%7B']):
-        # Se il path sembra un tentativo di mcp o contiene caratteri JSON
+    # Se il client prova a usare un path che contiene JSON (malformato)
+    if "session_id" in request.url.path or any(c in request.url.path for c in ['{', '%7B']):
         if request.method == "POST":
-            # Re-instrada internamente verso la logica di mcp_endpoint
-            # ma usando un mock di request che sembri puntare a /mcp
-            # In realtà, FastAPI non permette facilmente il re-routing interno senza duplicare la logica,
-            # quindi usiamo un trucco: eseguiamo la funzione direttamente.
             return await mcp_endpoint(request)
         return await sse_endpoint(request)
     
