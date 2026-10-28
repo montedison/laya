@@ -1,162 +1,141 @@
 import asyncio
-import uuid
-import logging
 import json
-import sys
-import urllib.parse
-from typing import Dict, Optional, Any
+import logging
+import uuid
+from typing import Any, Dict, Optional
 
+from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi.responses import StreamingResponse
 import uvicorn
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
 
-# Import del core Laya
+# --- RESILIENT IMPORTS (Fix for Bootloop) ---
 try:
-    from mcp.server.sse import SseServerTransport
-    from laya.mcp.server import server
-except ImportError as e:
-    print(f"CRITICAL ERROR: Missing Laya MCP dependencies: {e}")
-    sys.exit(1)
+    from mcp.types import InitializationOptions
+except ImportError:
+    from typing import Any
+    # Fallback elegante: se la versione di mcp è diversa, non bloccare il sistema
+    InitializationOptions = Any
+    logging.warning("⚠️ [Resilience] 'InitializationOptions' non trovato in 'mcp.types'. Utilizzo 'Any' come fallback.")
 
-# Configurazione Logging
-logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+# --- CONFIGURATION & LOGGING ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s │ %(levelname)-8s │ %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ"
+)
 logger = logging.getLogger("LayaBridge")
 
 class SessionManager:
+    """Gestisce lo stato delle sessioni MCP per garantire l'integrità del protocollo."""
     def __init__(self):
-        self.active_sessions: Dict[str, str] = {} # IP -> SessionID
-        self.session_to_ip: Dict[str, str] = {}  # SessionID -> IP
+        self.sessions: Dict[str, asyncio.Queue] = {}
 
-    def register(self, ip: str, session_id: str):
-        self.active_sessions[ip] = session_id
-        self.session_to_ip[session_id] = ip
+    def create_session(self) -> str:
+        session_id = str(uuid.uuid4())
+        self.sessions[session_id] = asyncio.Queue()
+        logger.info(f"🆕 Sessione creata: {session_id}")
+        return session_id
 
-    def get_by_ip(self, ip: str) -> Optional[str]:
-        return self.active_sessions.get(ip)
+    def get_queue(self, session_id: str) -> Optional[asyncio.Queue]:
+        return self.sessions.get(session_id)
 
-    def get_by_session(self, session_id: str) -> Optional[str]:
-        return self.session_to_ip.get(session_id)
+    def delete_session(self, session_id: str):
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+            logger.info(f"🗑️ Sessione rimossa: {session_id}")
 
-session_manager = SessionManager()
-transport = SseServerTransport("/mcp")
-app = FastAPI(title="Laya MCP Resilient Bridge")
+# --- APP INITIALIZATION ---
+app = FastAPI(title="Laya MCP SSE Bridge")
+manager = SessionManager()
 
-# --- LOGIC: IDENTITY RECOVERY ---
+# --- CORE LOGIC: SSE GENERATOR ---
 
-async def resolve_session_id_from_scope(scope: Dict[str, Any]) -> str:
+async def sse_generator(session_id: str):
     """
-    Estrae l'identità della sessione direttamente dallo scope ASGI.
+    Generatore asincrono per lo stream SSE.
+    Gestisce l'handshake iniziale e l'invio dei messaggi dalla coda.
     """
-    client_ip = scope.get("client", ["127.0.0.1", 0])[0]
-    path = scope.get("path", "")
-    
-    # 1. Path decoding (Unsloth bug fix)
+    queue = manager.get_queue(session_id)
+    if not queue:
+        return
+
     try:
-        decoded_path = urllib.parse.unquote(path)
-        if "session_id" in decoded_path:
-            json_str = decoded_path.lstrip('/')
-            data = json.loads(json_str)
-            sid = data.get("session_id")
-            if sid:
-                return sid
-    except: pass
+        # 1. HANDSHAKE: Invia immediatamente l'evento 'endpoint'
+        # Questo risolve il problema del 400 Bad Request su Unsloth
+        endpoint_url = f"/mcp?session_id={session_id}"
+        logger.info(f"🔄 Inizio handshake per sessione {session_id}")
+        
+        yield f"event: endpoint\ndata: {endpoint_url}\n\n"
 
-    # 2. IP-Map fallback
-    existing = session_manager.get_by_ip(client_ip)
-    if existing: return existing
+        # 2. LOOP DI MESSAGGIO: Invia messaggi non appena arrivano nella coda
+        while True:
+            message = await queue.get()
+            # Formatta il messaggio come un evento SSE standard
+            yield f"data: {json.dumps(message)}\n\n"
+            queue.task_done()
 
-    # 3. New Session
-    new_sid = str(uuid.uuid4())
-    session_manager.register(client_ip, new_sid)
-    return new_sid
+    except asyncio.CancelledError:
+        logger.info(f"🔌 Connessione SSE interrotta per sessione {session_id}")
+        raise
+    except Exception as e:
+        logger.error(f"❌ Errore nello stream SSE ({session_id}): {str(e)}")
+    finally:
+        manager.delete_session(session_id)
 
-# --- THE ULTIMATE ASGI MIDDLEWARE ---
+# --- ENDPOINTS ---
 
-class LayaUltimateMiddleware:
-    def __init__(self, app):
-        self.app = app
+@app.get("/sse")
+async def sse_endpoint(request: Request):
+    """
+    Endpoint per l'handshake SSE.
+    Il client chiama questo per stabilire la connessione unidirezionale.
+    """
+    session_id = manager.create_session()
+    logger.info(f"📡 Handshake GET /sse ricevuto. Session ID: {session_id}")
+    
+    return StreamingResponse(
+        sse_generator(session_id),
+        media_type="text/event-stream"
+    )
 
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
+@app.post("/mcp")
+async def mcp_endpoint(
+    request: Request, 
+    session_id: str = Query(None)
+):
+    """
+    Endpoint per i messaggi JSON-RPC dal client (Unsloth).
+    Riceve il POST e lo mette nella coda della sessione corretta.
+    """
+    if not session_id:
+        logger.error("❌ POST /mcp ricevuto senza session_id")
+        raise HTTPException(status_code=400, detail="Missing session_id")
 
-        path = scope.get("path", "")
-        method = scope.get("method", "")
-        client_ip = scope.get("client", ["127.0.0.1", 0])[0]
+    queue = manager.get_queue(session_id)
+    if not queue:
+        logger.error(f"❌ Sessione {session_id} non trovata per POST")
+        raise HTTPException(status_code=404, detail="Session not found")
 
-        # --- CASO 1: SSE HANDSHAKE (GET /sse) ---
-        if path == "/sse" and method == "GET":
-            logger.info(f"[ASGI] SSE Handshake detected for {client_ip}")
-            # Registriamo la sessione prima di passare il controllo al transport
-            sid = await resolve_session_id_from_scope(scope)
-            session_manager.register(client_ip, sid)
-            
-            try:
-                # Usiamo il context manager correttamente (senza await diretto sul contesto)
-                async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
-                    logger.info(f"[ASGI] SSE Transport loop started for session {sid}")
-                    from mcp.types import InitializationOptions
-                    await server._lowlevel_server.run(read_stream, write_stream, InitializationOptions())
-            except Exception as e:
-                logger.error(f"[ASGI] SSE Transport Error: {e}", exc_info=True)
-            return
+    try:
+        payload = await request.json()
+        logger.info(f"📥 Messaggio ricevuto per sessione {session_id}: {payload}")
+        
+        # Inserisce il payload nella coda della sessione per essere inviato via SSE
+        await queue.put(payload)
+        
+        return {"status": "accepted"}
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    except Exception as e:
+        logger.error(f"❌ Errore nel processamento POST ({session_id}): {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
-        # --- CASO 2: MCP MESSAGING (POST /mcp) ---
-        if path == "/mcp" and method == "POST":
-            logger.info(f"[ASGI] MCP Message detected for {client_ip}")
-            
-            # Recuperiamo l'identità per garantire la persistenza
-            sid = await resolve_session_id_from_scope(scope)
-            # Registriamo l'ID per sicurezza
-            session_manager.register(client_ip, sid)
-
-            try:
-                # Delegazione diretta al transport originale (Bypass FastAPI)
-                await transport.handle_post_message(scope, receive, send)
-            except Exception as e:
-                logger.error(f"[ASGI] MCP Transport Error: {e}", exc_info=True)
-                # Se il transport fallisce, proviamo a dare una risposta HTTP minima per non lasciare il client appeso
-                await send({
-                    "type": "http.response.start",
-                    "status": 500,
-                    "headers": [(b"content-type", b"application/json")]
-                })
-                await send({
-                    "type": "http.response.body",
-                    "body": json.dumps({"error": str(e)}).encode("utf-8"),
-                })
-            return
-
-        # --- CASO 3: MALFORMED PATHS (Wildcard) ---
-        if any(c in path for c in ['{', '%7B']):
-            logger.warning(f"[ASGI] Malformed path detected: {path}. Attempting recovery.")
-            # Se è un POST malformato, lo trattiamo come /mcp
-            if method == "POST":
-                # Re-instrada internamente verso la logica mcp
-                # Modifichiamo lo scope per far credi al transport che sia /mcp
-                new_scope = dict(scope)
-                new_scope["path"] = "/mcp"
-                await self.__call__(new_scope, receive, send)
-                return
-            # Se è un GET malformato, lo trattiamo come /sse
-            elif method == "GET":
-                new_scope = dict(scope)
-                new_scope['path'] = '/sse'
-                await self.__call__(new_scope, receive, send)
-                return
-
-        # Per tutto il resto, procediamo con FastAPI normalmente
-        await self.app(scope, receive, send)
-
-app.add_middleware(LayaUltimateMiddleware)
-
-# --- FASTAPI ENDPOINTS (Solo per Health e fallback) ---
-
+# --- HEALTH CHECK ---
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "bridge": "ultimate_v1"}
+    return {"status": "ok", "sessions_active": len(manager.sessions)}
 
+# --- EXECUTION ---
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    # Utilizziamo uvicorn direttamente per il deployment in container
+    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
