@@ -6,9 +6,9 @@ import sys
 import urllib.parse
 from typing import Dict, Optional, Any
 
-import uvicorn  # <--- FIX: Corretto da uvicon a uvicorn
+import uvicorn
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse
 
 # Import del core Laya
 try:
@@ -23,14 +23,13 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger("LayaBridge")
 
 class SessionManager:
-    """Gestisce la persistenza delle sessioni tra i vari tentativi del client."""
     def __init__(self):
         self.active_sessions: Dict[str, str] = {} # IP -> SessionID
         self.session_to_ip: Dict[str, str] = {}  # SessionID -> IP
 
     def register(self, ip: str, session_id: str):
         self.active_sessions[ip] = session_id
-        self.session_to_ip[session_id] = session_id # Corretto per consistenza
+        self.session_to_ip[session_id] = ip
 
     def get_by_ip(self, ip: str) -> Optional[str]:
         return self.active_sessions.get(ip)
@@ -42,125 +41,121 @@ session_manager = SessionManager()
 transport = SseServerTransport("/mcp")
 app = FastAPI(title="Laya MCP Resilient Bridge")
 
-# --- CORE LOGIC: PATCHING & ROUTING ---
+# --- LOGIC: IDENTITY RECOVERY ---
 
-async def resolve_session_id(request: Request) -> str:
+async def resolve_session_id_from_scope(scope: Dict[str, Any]) -> str:
     """
-    Risolve l'identità della sessione usando una gerarchia di fallback:
-    1. Path decodificato (per i bug del client Unsloth)
-    2. Body JSON
-    3. Mappa IP-Session
-    4. Generazione nuova sessione
+    Estrae l'identità della sessione direttamente dallo scope ASGI.
     """
-    client_ip = request.client.host
-    path = request.url.path
+    client_ip = scope.get("client", ["127.0.0.1", 0])[0]
+    path = scope.get("path", "")
     
-    # 1. Tentativo da PATH (Unsloth bug fix: /%7B%22session_id%22... )
+    # 1. Path decoding (Unsloth bug fix)
     try:
         decoded_path = urllib.parse.unquote(path)
         if "session_id" in decoded_path:
-            # Estrazione tramite parsing JSON dal path
             json_str = decoded_path.lstrip('/')
             data = json.loads(json_str)
             sid = data.get("session_id")
             if sid:
-                logger.warning(f"[PROTOCOL] Recovered SID from malformed path: {sid}")
                 return sid
-    except Exception:
-        pass
+    except: pass
 
-    # 2. Tentativo da BODY
-    try:
-        body = await request.json()
-        if "session_id" in body:
-            return body["session_id"]
-    except Exception:
-        pass
-
-    # 3. Tentativo da IP-MAP
+    # 2. IP-Map fallback
     existing = session_manager.get_by_ip(client_ip)
-    if existing:
-        return existing
+    if existing: return existing
 
-    # 4. Fallback: Nuova sessione
+    # 3. New Session
     new_sid = str(uuid.uuid4())
     session_manager.register(client_ip, new_sid)
-    logger.info(f"[PROTOCOL] Created new session for {client_ip}: {new_sid}")
     return new_sid
 
-# --- THE ASGI MIDDLEWARE (The Fix) ---
+# --- THE ULTIMATE ASGI MIDDLEWARE ---
 
-class SseDirectMiddleware:
-    """
-    Intercetta le richieste SSE a livello ASGI prima che FastAPI 
-    tenti di gestirle come endpoint HTTP standard.
-    """
+class LayaUltimateMiddleware:
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            path = scope.get("path", "")
-            # Intercettiamo sia il path standard /sse che i path malformati con JSON
-            is_sse_path = path == "/sse" or any(c in path for c in ['{', '%7B'])
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        method = scope.get("method", "")
+        client_ip = scope.get("client", ["127.0.0.1", 0])[0]
+
+        # --- CASO 1: SSE HANDSHAKE (GET /sse) ---
+        if path == "/sse" and method == "GET":
+            logger.info(f"[ASGI] SSE Handshake detected for {client_ip}")
+            # Registriamo la sessione prima di passare il controllo al transport
+            sid = await resolve_session_id_from_scope(scope)
+            session_manager.register(client_ip, sid)
             
-            if is_sse_path:
-                logger.info(f"[ASGI] Intercepting SSE/Malformed handshake at low-level: {path}")
-                try:
-                    # Passiamo lo scope originale al transport ufficiale
-                    await transport.connect_sse(scope, receive, send)
-                except Exception as e:
-                    logger.error(f"[ASGI] SSE Transport Error: {e}", exc_info=True)
+            try:
+                # Usiamo il context manager correttamente (senza await diretto sul contesto)
+                async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
+                    logger.info(f"[ASGI] SSE Transport loop started for session {sid}")
+                    from mcp.types import InitializationOptions
+                    await server._lowlevel_server.run(read_stream, write_stream, InitializationOptions())
+            except Exception as e:
+                logger.error(f"[ASGI] SSE Transport Error: {e}", exc_info=True)
+            return
+
+        # --- CASO 2: MCP MESSAGING (POST /mcp) ---
+        if path == "/mcp" and method == "POST":
+            logger.info(f"[ASGI] MCP Message detected for {client_ip}")
+            
+            # Recuperiamo l'identità per garantire la persistenza
+            sid = await resolve_session_id_from_scope(scope)
+            # Registriamo l'ID per sicurezza
+            session_manager.register(client_ip, sid)
+
+            try:
+                # Delegazione diretta al transport originale (Bypass FastAPI)
+                await transport.handle_post_message(scope, receive, send)
+            except Exception as e:
+                logger.error(f"[ASGI] MCP Transport Error: {e}", exc_info=True)
+                # Se il transport fallisce, proviamo a dare una risposta HTTP minima per non lasciare il client appeso
+                await send({
+                    "type": "http.response.start",
+                    "status": 500,
+                    "headers": [(b"content-type", b"application/json")]
+                })
+                await send({
+                    "type": "http.response.body",
+                    "body": json.dumps({"error": str(e)}).encode("utf-8"),
+                })
+            return
+
+        # --- CASO 3: MALFORMED PATHS (Wildcard) ---
+        if any(c in path for c in ['{', '%7B']):
+            logger.warning(f"[ASGI] Malformed path detected: {path}. Attempting recovery.")
+            # Se è un POST malformato, lo trattiamo come /mcp
+            if method == "POST":
+                # Re-instrada internamente verso la logica mcp
+                # Modifichiamo lo scope per far credi al transport che sia /mcp
+                new_scope = dict(scope)
+                new_scope["path"] = "/mcp"
+                await self.__call__(new_scope, receive, send)
+                return
+            # Se è un GET malformato, lo trattiamo come /sse
+            elif method == "GET":
+                new_scope = dict(scope)
+                new_scope['path'] = '/sse'
+                await self.__call__(new_scope, receive, send)
                 return
 
-        # Per tutto il resto, procediamo con FastAPI
+        # Per tutto il resto, procediamo con FastAPI normalmente
         await self.app(scope, receive, send)
 
-app.add_middleware(SseDirectMiddleware)
+app.add_middleware(LayaUltimateMiddleware)
 
-# --- FASTAPI ENDPOINTS (For POST /mcp) ---
+# --- FASTAPI ENDPOINTS (Solo per Health e fallback) ---
 
-@app.post("/mcp")
-async def mcp_endpoint(request: Request):
-    # 1. Risoluzione identità
-    session_id = await resolve_session_id(request)
-    
-    # 2. Patching del body per coerenza (garantisce che il transport veda il session_id)
-    try:
-        body = await request.json()
-        if "session_id" not in body:
-            body["session_id"] = session_id
-    except Exception:
-        body = {"session_id": session_id}
-
-    # 3. Delegazione al transport originale (Gestione JSON-RPC 2.0)
-    return await transport.handle_post_message(request.scope, request.receive, request.send)
-
-@app.get("/sse")
-async def sse_endpoint(request: Request):
-    """
-    Endpoint di fallback per il GET /sse (se non intercettato dal middleware).
-    """
-    client_ip = request.client.host
-    existing_id = request.query_params.get("session_id")
-    session_id = await resolve_session_id(request)
-    session_manager.register(client_ip, session_id)
-    
-    # Nota: Il middleware dovrebbe intercettarlo, ma teniamo questo per sicurezza.
-    return await transport.connect_sse(request.scope, request.receive, request.send)
-
-@app.api_route("/{path_name:path}", methods=["GET", "POST"])
-async def catch_all(request: Request):
-    path = request.url.path
-    # Se il client sta usando il path malformato con l'ID, lo re-instrada al mcp_endpoint
-    if any(c in path for c in ['{', '%7B']):
-        if request.method == "POST":
-            return await mcp_endpoint(request)
-        else:
-            # Se è un GET malformato, lo mandiamo all'endpoint SSE
-            return await sse_endpoint(request)
-    
-    raise HTTPException(status_code=404, detail="Not Found")
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "bridge": "ultimate_v1"}
 
 if __name__ == "__main__":
     import uvicorn
