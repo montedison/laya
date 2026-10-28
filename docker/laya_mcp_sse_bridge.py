@@ -3,6 +3,7 @@ import uuid
 import logging
 import json
 import sys
+import urllib.parse  # Per decodificare i path malformati
 from typing import Dict, Optional, Any
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
@@ -36,19 +37,60 @@ class LayaMcpSseBridge:
         self.client_to_session_map[client_ip] = new_id
         return new_id
 
+    async def extract_session_from_path(self, path: str) -> Optional[str]:
+        """
+        DEFESA 1: Estrae l'ID anche se il client lo invia come path URL-encoded.
+        Esempio: /%7B%22session_id%22%3A%20%22uuid%22%7D -> uuid
+        """
+        try:
+            decoded_path = urllib.parse.unquote(path)
+            # Se il path contiene un JSON string, proviamo a parsarlo
+            if "session_id" in decoded_path:
+                # Pulizia del path per isolare il JSON (rimuovendo eventuali prefissi '/')
+                json_str = decoded_path.lstrip('/')
+                data = json.loads(json_str)
+                return data.get("session_id")
+        except Exception:
+            return None
+        return None
+
     async def patch_request(self, request: Request) -> Dict[str, Any]:
+        """
+        DEFESA 2: Orchestrazione del recupero identità.
+        """
         client_ip = request.client.host
+        path = request.url.path
+        
+        # 1. Tentativo di estrazione dal PATH (per i client malformati)
+        session_id_from_path = await self.extract_session_from_path(path)
+        
+        # 2. Tentativo di estrazione dal BODY
+        body = {}
         try:
             body = await request.json()
         except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload")
-        
-        if "session_id" not in body:
+            pass
+
+        # Logica di priorità per il session_id
+        final_session_id = None
+        if session_id_from_path:
+            final_session_id = session_id_from_path
+            logger.warning(f"[PROTOCOL] Identity recovered from MALFORMED PATH: {final_session_id}")
+        elif "session_id" in body:
+            final_session_id = body["session_id"]
+        else:
+            # 3. Fallback sulla mappa IP-Session
             recovered_id = self.client_to_session_map.get(client_ip)
-            if not recovered_id or recovered_id not in self.active_sessions:
-                raise HTTPException(status_code=403, detail="No active session found")
-            body["session_id"] = recovered_id
-        
+            if recovered_id:
+                final_session_id = recovered_id
+                logger.warning(f"[PROTOCOL] Identity recovered from IP-MAP: {final_session_id}")
+
+        if not final_session_id or final_session_id not in self.active_sessions:
+            logger.error(f"[PROTOCOL] Identity Recovery Failed for {client_ip}. Path: {path}")
+            raise HTTPException(status_code=403, detail="No active session found")
+
+        # Inseriamo l'ID nel body per garantire la consistenza interna
+        body["session_id"] = final_session_id
         return body
 
 bridge = LayaMcpSseBridge()
@@ -62,7 +104,6 @@ async def sse_endpoint(request: Request):
 
     async def event_generator():
         try:
-            # Invia l'ID al client via SSE
             yield f"event: endpoint\ndata: {json.dumps({'session_id': session_id})}\n\n"
             while True:
                 await asyncio.sleep(20)
@@ -79,41 +120,51 @@ async def sse_endpoint(request: Request):
 
 @app.post("/mcp")
 async def mcp_endpoint(request: Request):
-    """
-    JSON-RPC 2.0 COMPLIANT RESPONDER
-    """
+    # Gestione errori di patching
     try:
-        # 1. Patching del payload
         patched_body = await bridge.patch_request(request)
     except HTTPException as he:
         raise he
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"[PROTOCOL] Critical Patch Error: {str(e)}")
+        raise HTTPException(status_code=400, detail="Invalid request context")
 
     session_id = patched_body["session_id"]
 
-    if session_id not in bridge.active_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    # 2. Estrazione ID della richiesta (se presente, altrimenti generiamo un fallback)
-    # Il protocollo JSON-RPC richiede un 'id' per abbinare la risposta alla richiesta.
+    # Risposta JSON-RPC 2.0 conforme
     request_id = patched_body.get("id", "1")
-
-    # 3. Costruzione della risposta JSON-RPC 2.0
-    # Questo risolve il ValidationError di Pydantic in Unsloth.
     rpc_response = {
         "jsonrpc": "2.0",
         "id": request_id,
         "result": {
             "status": "success",
             "session_id": session_id,
-            "message": "Bridge is online and JSON-RPC compliant",
             "data": "MCP_ACK"
         }
     }
 
-    logger.info(f"[PROTOCOL] Responded with JSON-RPC 2.0 to session {session_id}")
+    logger.info(f"[PROTOCOL] Responded to session {session_id} via JSON-RPC 2.0")
     return rpc_response
+
+# Aggiungiamo un router per catturare i path malformati (es. /%7B%22...)
+# Questo evita il 404 e permette al nostro patch_request di agire
+@app.api_route("/{path_name:path}", methods=["POST", "GET"])
+async def catch_all_route(request: Request):
+    """
+    CATTURA TUTTO: Se il client invia un JSON nel path, questo router lo intercetta
+    e lo instrada verso la logica /mcp.
+    """
+    if "/mcp" in request.url.path or any(c in request.url.path for c in ['{', '%7B']):
+        # Se il path sembra un tentativo di mcp o contiene caratteri JSON
+        if request.method == "POST":
+            # Re-instrada internamente verso la logica di mcp_endpoint
+            # ma usando un mock di request che sembri puntare a /mcp
+            # In realtà, FastAPI non permette facilmente il re-routing interno senza duplicare la logica,
+            # quindi usiamo un trucco: eseguiamo la funzione direttamente.
+            return await mcp_endpoint(request)
+        return await sse_endpoint(request)
+    
+    raise HTTPException(status_code=404, detail="Not Found")
 
 if __name__ == "__main__":
     import uvicorn
