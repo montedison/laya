@@ -11,11 +11,10 @@ from fastapi.responses import StreamingResponse
 import uvicorn
 
 # --- FORCE LOGGING IMMEDIATELY ---
-# Configuriamo il logging PRIMA di qualsiasi altra cosa per vedere i messaggi di debug
 logging.basicConfig(
     level=logging.INFO, 
     format="%(asctime)s │ %(levelname)-8s │ %(message)s",
-    stream=sys.stdout # Forza l'output su stdout per Docker
+    stream=sys.stdout
 )
 logger = logging.getLogger("LayaBridge")
 
@@ -38,11 +37,12 @@ class MCPProtocolEngine:
     def __init__(self):
         self.laya_module = None
         self.router_instance = None
+        # Registry structure: { name: (callable, schema_dict) }
         self._tool_registry: Dict[str, tuple[Callable, Dict[str, Any]]] = {}
 
     def _ensure_laya(self):
         if self.laya_module is None:
-            logger.info("⏳ [IMPORT] Tentativo di importazione modulo 'laya' in corso... (Potrebbe richiedere tempo se carica i pesi)")
+            logger.info("⏳ [IMPORT] Tentativo di importazione modulo 'laya' in corso...")
             try:
                 import laya
                 self.laya_module = laya
@@ -65,7 +65,8 @@ class MCPProtocolEngine:
 
     def _build_unified_registry(self):
         logger.info("🛠️ [REGISTRY] Costruzione del registro unificato dei tool...")
-        # 1. Mapping dei tool basato sul README per garantire la stabilità
+        
+        # Mapping basato sul router Laya
         mapping = {
             "laya_status": ("status", {}),
             "laya_predict": ("predict", {}),
@@ -80,16 +81,17 @@ class MCPProtocolEngine:
         }
 
         if self.router_instance:
-            for mcp_name, (method_name, _) in mapping.items():
+            for mcp_name, (method_name, schema) in mapping.items():
                 try:
                     func = getattr(self.router_instance, method_name)
-                    self._tool_registry[mcp_name] = (func, {"type": "object", "properties": {}})
+                    # Registriamo la funzione e lo schema direttamente
+                    self._tool_registry[mcp_name] = (func, schema)
                 except AttributeError:
                     logger.warning(f"⚠️ [REGISTRY] Metodo '{method_name}' non trovato nel Router di Laya.")
         
-        # 2. Fallback di sicurezza per l'handshake
+        # Fallback di sicurezza
         self._tool_registry["laya_health_check"] = (self._fallback_health_check, {"type": "object", "properties": {}})
-        logger.info(f"✅ [REGISTRY] Registro completato. Tool caricati: {list(self._tool_registry.keys())}")
+        logger.info(f"✅ [REGISTRY] Registro completato. Tool pronti: {list(self._tool_registry.keys())}")
 
     async def _fallback_health_check(self, **kwargs) -> Any:
         return {"status": "ok", "mode": "fallback"}
@@ -98,28 +100,48 @@ class MCPProtocolEngine:
         method = payload.get("method")
         request_id = payload.get("id")
 
+        # 1. HANDSHAKE (Fix: Garantisce la dichiarazione delle capabilities)
         if method == "initialize":
+            logger.info(f"🤝 [HANDSHAKE] Ricevuta richiesta 'initialize' (ID: {request_id})")
             return {
-                "jsonrpc": "2.0", "id": request_id,
+                "jsonrpc": "2.0", 
+                "id": request_id,
                 "result": {
                     "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}, "resources": {}, "logging": {}},
+                    "capabilities": {
+                        "tools": {}, 
+                        "resources": {}, 
+                        "logging": {}
+                    },
                     "serverInfo": {"name": "laya-mcp-bridge", "version": "1.0.0"}
                 }
             }
 
+        # 2. TOOL DISCOVERY (Fix: Corretto KeyError nello schema)
         if method == "tools/list":
-            return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": [
-                {"name": n, "description": "Laya tool", "inputSchema": s["inputSchema"]} 
-                for n, (_, s) in self._tool_registry.items()
-            ]}}
+            logger.info(f"🔍 [DISCOVERY] Richiesta 'tools/list' (ID: {request_id})")
+            tools_list = []
+            for name, (func, schema) in self._tool_registry.items():
+                tools_list.append({
+                    "name": name,
+                    "description": f"Laya tool: {name}",
+                    "inputSchema": schema # Passiamo lo schema direttamente
+                })
+            return {
+                "jsonrpc": "2.0", 
+                "id": request_id, 
+                "result": {"tools": tools_list}
+            }
 
+        # 3. TOOL EXECUTION
         if method == "tools/call":
             return await self._handle_tool_call(payload)
 
+        # 4. NO-OP METHODS
         if method in ["notifications/initialized", "resources/list", "ping"]:
             return None
 
+        logger.warning(f"❓ [UNKNOWN] Metodo ricevuto non gestito: {method}")
         return None
 
     async def _handle_tool_call(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -129,6 +151,7 @@ class MCPProtocolEngine:
         request_id = payload.get("id")
 
         if name not in self._tool_registry:
+            logger.error(f"❌ [CALL] Tool '{name}' non trovato nel registro.")
             return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Tool '{name}' not found"}}
 
         func, _ = self._tool_registry[name]
@@ -138,10 +161,22 @@ class MCPProtocolEngine:
                 result = await func(**args)
             else:
                 result = await asyncio.to_thread(func, **args)
-            return {"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": json.dumps(result)}]}}
+            
+            # Formattazione standard MCP per il contenuto testuale
+            return {
+                "jsonrpc": "2.0", 
+                "id": request_id, 
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(result)}]
+                }
+            }
         except Exception as e:
             logger.error(f"❌ [EXEC] Errore tool '{name}': {str(e)}")
-            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": str(e)}}
+            return {
+                "jsonrpc": "2.0", 
+                "id": request_id, 
+                "error": {"code": -32603, "message": str(e)}
+            }
 
 # --- SESSION & APP ---
 
@@ -181,13 +216,17 @@ async def sse_endpoint(request: Request):
 async def mcp_endpoint(request: Request, session_id: str = Query(None)):
     if not session_id or not manager.get_queue(session_id):
         raise HTTPException(status_code=400, detail="Invalid Session")
+    
     payload = await request.json()
     response = await engine.process_request(payload)
+    
     if response:
         await manager.get_queue(session_id).put(response)
+    
     return {"status": "accepted"}
 
 if __name__ == "__main__":
-    # Avvio con log massimi per debug
-    logger.info("🏁 [FINAL] Avvio server Uvicorn...")
+    # Assicuriamoci di caricare laya prima di avviare il server
+    engine._ensure_laya()
+    logger.info("🏁 [FINAL] Avvio server Uvicorn su porta 8001...")
     uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
