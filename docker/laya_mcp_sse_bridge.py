@@ -14,7 +14,7 @@ import uvicorn
 logging.basicConfig(
     level=logging.INFO, 
     format="%(asctime)s │ %(levelname)-8s │ %(message)s",
-    stream=sys.stdout
+    stream=sys.stdout 
 )
 logger = logging.getLogger("LayaBridge")
 
@@ -39,6 +39,8 @@ class MCPProtocolEngine:
         self.router_instance = None
         # Registry structure: { name: (callable, schema_dict) }
         self._tool_registry: Dict[str, tuple[Callable, Dict[str, Any]]] = {}
+        # Standard schema per evitare che i client scartino i tool per schemi vuoti
+        self._base_schema = {"type": "object", "properties": {}}
 
     def _ensure_laya(self):
         if self.laya_module is None:
@@ -68,29 +70,28 @@ class MCPProtocolEngine:
         
         # Mapping basato sul router Laya
         mapping = {
-            "laya_status": ("status", {}),
-            "laya_predict": ("predict", {}),
-            "laya_predict_batch": ("predict_batch", {}),
-            "laya_predict_long": ("predict_long", {}),
-            "laya_route": ("route", {}),
-            "laya_route_batch": ("route_batch", {}),
-            "laya_decide": ("decide", {}),
-            "laya_shortlist": ("predict_shortlist", {}),
-            "laya_tournament": ("predict_tournament", {}),
-            "laya_preset": ("predict_preset", {}),
+            "laya_status": ("status", self._base_schema),
+            "laya_predict": ("predict", self._base_schema),
+            "laya_predict_batch": ("predict_batch", self._base_schema),
+            "laya_predict_long": ("predict_long", self._base_schema),
+            "laya_route": ("route", self._base_schema),
+            "laya_route_batch": ("route_batch", self._base_schema),
+            "laya_decide": ("decide", self._base_schema),
+            "laya_shortlist": ("predict_shortlist", self._base_schema),
+            "laya_tournament": ("predict_tournament", self._base_schema),
+            "laya_preset": ("predict_preset", self._base_schema),
         }
 
         if self.router_instance:
             for mcp_name, (method_name, schema) in mapping.items():
                 try:
                     func = getattr(self.router_instance, method_name)
-                    # Registriamo la funzione e lo schema direttamente
                     self._tool_registry[mcp_name] = (func, schema)
                 except AttributeError:
                     logger.warning(f"⚠️ [REGISTRY] Metodo '{method_name}' non trovato nel Router di Laya.")
         
         # Fallback di sicurezza
-        self._tool_registry["laya_health_check"] = (self._fallback_health_check, {"type": "object", "properties": {}})
+        self._tool_registry["laya_health_check"] = (self._fallback_health_check, self._base_schema)
         logger.info(f"✅ [REGISTRY] Registro completato. Tool pronti: {list(self._tool_registry.keys())}")
 
     async def _fallback_health_check(self, **kwargs) -> Any:
@@ -100,7 +101,7 @@ class MCPProtocolEngine:
         method = payload.get("method")
         request_id = payload.get("id")
 
-        # 1. HANDSHAKE (Fix: Garantisce la dichiarazione delle capabilities)
+        # 1. HANDSHAKE (Garantisce la dichiarazione delle capabilities)
         if method == "initialize":
             logger.info(f"🤝 [HANDSHAKE] Ricevuta richiesta 'initialize' (ID: {request_id})")
             return {
@@ -117,7 +118,7 @@ class MCPProtocolEngine:
                 }
             }
 
-        # 2. TOOL DISCOVERY (Fix: Corretto KeyError nello schema)
+        # 2. TOOL DISCOVERY (Fix: Corretto il KeyError e l'assegnazione dello schema)
         if method == "tools/list":
             logger.info(f"🔍 [DISCOVERY] Richiesta 'tools/list' (ID: {request_id})")
             tools_list = []
@@ -125,7 +126,7 @@ class MCPProtocolEngine:
                 tools_list.append({
                     "name": name,
                     "description": f"Laya tool: {name}",
-                    "inputSchema": schema # Passiamo lo schema direttamente
+                    "inputSchema": schema # Passiamo lo schema direttamente, senza cercare chiavi interne
                 })
             return {
                 "jsonrpc": "2.0", 
@@ -162,7 +163,6 @@ class MCPProtocolEngine:
             else:
                 result = await asyncio.to_thread(func, **args)
             
-            # Formattazione standard MCP per il contenuto testuale
             return {
                 "jsonrpc": "2.0", 
                 "id": request_id, 
@@ -226,7 +226,6 @@ async def mcp_endpoint(request: Request, session_id: str = Query(None)):
     return {"status": "accepted"}
 
 if __name__ == "__main__":
-    # Assicuriamoci di caricare laya prima di avviare il server
     engine._ensure_laya()
     logger.info("🏁 [FINAL] Avvio server Uvicorn su porta 8001...")
     uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
