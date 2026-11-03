@@ -296,8 +296,13 @@ SESSION_RE = re.compile(r'"session_id"\s*:\s*"([0-9a-fA-F-]{36})"')
 
 
 def _client_ip(scope) -> Optional[str]:
-    conn = scope.get("client") or {}
-    return conn.get("host")
+    """ASGI: scope['client'] is a (host, port) tuple; tolerate dict/absent."""
+    conn = scope.get("client")
+    if isinstance(conn, tuple):
+        return conn[0] if conn else None
+    if isinstance(conn, dict):
+        return conn.get("host")
+    return None
 
 
 def _extract_session_from_path(path: str) -> Optional[str]:
