@@ -224,13 +224,15 @@ class MCPProtocolEngine:
                 raise RuntimeError(f"laya.{attr_name} not available in this version")
             return builder()
 
-        preset_fn = self._tool_registry["laya_preset"][0]
+        # --- FIX START ---
+        # Unpack existing registration to preserve the correctly derived schema and mapper
+        preset_callable, preset_schema, preset_mapper = self._tool_registry["laya_preset"]
 
         def preset_wrapper(**kw):
             kw.setdefault("preset_builder", preset_builder)
-            return preset_fn(**kw)
+            return preset_callable(**kw)
 
-        self._tool_registry["laya_preset"] = (preset_wrapper, self._base_schema, preset_mapper)
+        self._tool_registry["laya_preset"] = (preset_wrapper, preset_schema, preset_mapper)
 
         # Bridge-native probe (NOT part of the laya contract: no fail-fast on it)
         self._tool_registry["laya_health_check"] = (
