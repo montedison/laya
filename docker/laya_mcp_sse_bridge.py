@@ -1,6 +1,18 @@
 """
-laya_mcp_sse_bridge.py — v7.2
+laya_mcp_sse_bridge.py — v7.3
 Resilient HTTP/SSE bridge: Unsloth (MCP client / fastmcp) -> LAYA (MCP server).
+
+v7.3 changes vs v7.2:
+  - inputSchema now DERIVED from the laya.mcp.tools signatures (inspect):
+    the LLM sees real parameter names, types, required fields and
+    descriptions. The v7.2 empty {"properties": {}} schema is the root
+    cause of clients sending {} arguments.
+  - Mappers replaced by a pass-through: every argument the tool accepts
+    is forwarded (min_confidence, lang_guess, model, ... no longer
+    silently dropped); Unsloth aliases question/text -> state and
+    batch -> requests are still absorbed.
+  - _client_ip: scope['client'] is an ASGI (host, port) tuple, not a
+    dict (fixed the 500 on GET /sse).
 
 v7.2 changes vs v7.1:
   - Tool registry rebuilt on laya.mcp.tools (the same module laya-mcp-server
@@ -26,13 +38,15 @@ v7.1 transport layer (unchanged):
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import re
 import sys
+import typing
 import urllib.parse
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import uvicorn
 from fastapi import FastAPI, Query, Request
@@ -89,6 +103,80 @@ class MCPProtocolEngine:
                 raise
         return self.laya_module
 
+    # Parameters the bridge injects itself: invisible to the MCP client.
+    _BRIDGE_INJECTED = ("router", "preset_builder", "agent")
+
+    # LLM-facing docs for the parameters that carry the most weight.
+    _PARAM_DOC = {
+        "state": "Content to evaluate, as a JSON object (e.g. {\"body\": \"...\"}) or a plain string. Must be non-empty.",
+        "questions": "Typed questions: {name: {type: 'choice'|'score'|'noul', instructions: str, criteria: object|array}}.",
+        "schema": "JSON schema object: properties are enum choices, booleans, or bounded integers.",
+        "requests": "Non-empty array of {state, questions, ...} request objects.",
+        "preset": "Built-in workflow name: guard | moderation | triage | router | email.",
+        "min_confidence": "Number in [0,1]: answers below this calibrated confidence are flagged low_confidence.",
+        "lang_guess": "Soft ISO language hint (e.g. 'de'); participates in routing, does not force it.",
+        "model": "Checkpoint to pin ('english', 'multilingual', 'auto'); omit to let the router decide.",
+    }
+
+    @staticmethod
+    def _json_type(annotation) -> str:
+        """Best-effort JSON-Schema type for a Python annotation."""
+        if annotation is inspect.Parameter.empty:
+            return "object"
+        origin = typing.get_origin(annotation)
+        if origin is list or annotation is list:
+            return "array"
+        if origin is dict or annotation is dict:
+            return "object"
+        if annotation is str:
+            return "string"
+        if annotation is bool:
+            return "boolean"
+        if annotation is int:
+            return "integer"
+        if annotation is float:
+            return "number"
+        args = [a for a in typing.get_args(annotation) if a is not type(None)]
+        if args:  # Optional[X] / X | None
+            return MCPProtocolEngine._json_type(args[0])
+        return "object"
+
+    def _schema_from_signature(self, fn) -> Dict[str, Any]:
+        """Derive the tool's inputSchema from its signature.
+
+        Single source of truth: if laya changes a signature, the schema
+        follows automatically (no hand-maintained copy)."""
+        props: Dict[str, Any] = {}
+        required = []
+        for pname, p in inspect.signature(fn).parameters.items():
+            if pname in self._BRIDGE_INJECTED:
+                continue
+            entry = {"type": self._json_type(p.annotation)}
+            if pname in self._PARAM_DOC:
+                entry["description"] = self._PARAM_DOC[pname]
+            props[pname] = entry
+            if p.default is inspect.Parameter.empty:
+                required.append(pname)
+        return {"type": "object", "properties": props, "required": required}
+
+    def _make_mapper(self, accepted: tuple) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
+        """Pass through every argument the tool accepts (no silent drop),
+        absorbing the Unsloth aliases question/text -> state, batch -> requests."""
+        def mapper(args: Dict[str, Any]) -> Dict[str, Any]:
+            out: Dict[str, Any] = {}
+            for k in accepted:
+                if args.get(k) is not None:
+                    out[k] = args[k]
+            if "state" not in out:
+                for alias in ("question", "text"):
+                    if args.get(alias) is not None:
+                        out["state"] = args[alias]
+                        break
+            if "requests" not in out and args.get("batch") is not None:
+                out["requests"] = args["batch"]
+            return out
+        return mapper
+
     # ── REGISTRY (single source of truth: laya.mcp.tools) ──
     def _build_unified_registry(self):
         logger.info("🛠️ [REGISTRY] Building from laya.mcp.tools (same source as laya-mcp-server)...")
@@ -107,40 +195,7 @@ class MCPProtocolEngine:
                 "Aborting: the bridge never exposes a partial surface silently."
             )
 
-        # ── Semantic mappers: the only format-adaptation layer (Unsloth -> laya)
-        def predict_mapper(args):
-            return {
-                "state": args.get("question") or args.get("text") or args.get("state"),
-                "questions": args.get("questions"),
-            }
-
-        def decide_mapper(args):
-            return {
-                "state": args.get("question") or args.get("text") or args.get("state"),
-                "schema": args.get("schema"),
-            }
-
-        def batch_mapper(args):
-            return {"requests": args.get("requests") or args.get("batch") or [args]}
-
-        def preset_mapper(args):
-            m = predict_mapper(args)
-            m["preset"] = args.get("preset")
-            return m
-
-        mappers = {
-            "laya_predict": predict_mapper,
-            "laya_predict_batch": batch_mapper,
-            "laya_predict_long": predict_mapper,
-            "laya_route": predict_mapper,
-            "laya_route_batch": batch_mapper,
-            "laya_decide": decide_mapper,
-            "laya_shortlist": predict_mapper,
-            "laya_tournament": predict_mapper,
-            "laya_preset": preset_mapper,
-            "laya_status": lambda a: {},
-        }
-
+        # ── Schema + mappers: derived from the laya.mcp.tools signatures ──
         def bind_router(fn):
             """Inject the resident Router (same delegation as laya/mcp/server.py)."""
             def wrapper(**kw):
@@ -149,8 +204,16 @@ class MCPProtocolEngine:
             return wrapper
 
         for name in self.EXPECTED_TOOLS:
-            fn = bind_router(getattr(_lt, name))
-            self._tool_registry[name] = (fn, self._base_schema, mappers[name])
+            raw_fn = getattr(_lt, name)
+            accepted = tuple(
+                p for p in inspect.signature(raw_fn).parameters
+                if p not in self._BRIDGE_INJECTED
+            )
+            self._tool_registry[name] = (
+                bind_router(raw_fn),
+                self._schema_from_signature(raw_fn),
+                self._make_mapper(accepted),
+            )
 
         # laya_preset requires preset_builder (ToolError without it):
         # identical injection to laya/mcp/server.py.
