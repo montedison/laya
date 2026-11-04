@@ -1,6 +1,21 @@
 """
-laya_mcp_sse_bridge.py — v7.3
+laya_mcp_sse_bridge.py — v7.4
 Resilient HTTP/SSE bridge: Unsloth (MCP client / fastmcp) -> LAYA (MCP server).
+
+v7.4 changes vs v7.3:
+  - Pre-flight gate in tools/call: schema-driven required-params validation
+    returns JSON-RPC -32602 (Invalid Params) instead of surfacing a raw
+    Python TypeError for empty {} calls (the client's first blind call now
+    gets an explicit, self-explanatory error).
+  - Policy observability: WARN log when laya_predict* is called without
+    min_confidence (the skill contract expects 0.7). The bridge NEVER
+    injects the value silently: the gating policy stays with the client.
+  - Router preload enabled at boot (english + multilingual) to eliminate
+    the ~83s first-call cold start. A preload failure degrades to lazy
+    loading with a WARN — never fatal.
+  - laya_preset registration fixed: the signature-derived schema and mapper
+    are preserved (v7.3 shipped an undefined 'preset_mapper' -> NameError
+    at boot, and would have served an empty schema even if it booted).
 
 v7.3 changes vs v7.2:
   - inputSchema now DERIVED from the laya.mcp.tools signatures (inspect):
@@ -91,9 +106,15 @@ class MCPProtocolEngine:
             try:
                 import laya
                 self.laya_module = laya
-                self.router_instance = laya.Router()   # lazy: no download at boot
-                # Optional preload (comment out to keep the lazy default):
-                # self.router_instance.preload(["english", "multilingual"])
+                self.router_instance = laya.Router()
+                # Preload the resident checkpoints: eliminates the first-call
+                # cold start (~80s on CPU). A preload failure must NOT kill
+                # the bridge: degrade to lazy loading (WARN, anti-E9).
+                try:
+                    self.router_instance.preload(["english", "multilingual"])
+                    logger.info("✅ [PRELOAD] Checkpoints resident (english, multilingual).")
+                except Exception as e:
+                    logger.warning(f"⚠️ [PRELOAD] Failed ({e!r}); falling back to lazy loading.")
                 self._build_unified_registry()
                 logger.info("✅ [ROUTER] Router + registry complete.")
             except Exception as e:
@@ -224,13 +245,13 @@ class MCPProtocolEngine:
                 raise RuntimeError(f"laya.{attr_name} not available in this version")
             return builder()
 
-        # --- FIX START ---
-        # Unpack existing registration to preserve the correctly derived schema and mapper
-        preset_callable, preset_schema, preset_mapper = self._tool_registry["laya_preset"]
+        # Unpack the existing registration to PRESERVE the signature-derived
+        # schema and mapper (v7.3 shipped an undefined 'preset_mapper' here).
+        preset_fn, preset_schema, preset_mapper = self._tool_registry["laya_preset"]
 
         def preset_wrapper(**kw):
             kw.setdefault("preset_builder", preset_builder)
-            return preset_callable(**kw)
+            return preset_fn(**kw)
 
         self._tool_registry["laya_preset"] = (preset_wrapper, preset_schema, preset_mapper)
 
@@ -259,7 +280,7 @@ class MCPProtocolEngine:
                 "result": {
                     "protocolVersion": version,
                     "capabilities": {"tools": {}, "resources": {}, "logging": {}},
-                    "serverInfo": {"name": "laya-mcp-bridge", "version": "7.2"},
+                    "serverInfo": {"name": "laya-mcp-bridge", "version": "7.4"},
                 },
             }
 
@@ -303,6 +324,23 @@ class MCPProtocolEngine:
         fn, schema, mapper = self._tool_registry[name]
         try:
             translated_args = mapper(args)
+            # PRE-FLIGHT GATE: schema-driven validation. An explicit -32602
+            # (Invalid Params) is far more actionable for the client LLM than
+            # a raw Python TypeError.
+            required = schema.get("required", [])
+            missing = [r for r in required if translated_args.get(r) is None]
+            if missing:
+                msg = (f"{name}() missing required parameters: {', '.join(missing)} "
+                       "— see inputSchema")
+                logger.error(f"❌ [EXEC] Pre-flight failed for '{name}': missing {missing}")
+                return {"jsonrpc": "2.0", "id": request_id,
+                        "error": {"code": -32602, "message": msg}}
+            # POLICY OBSERVABILITY: the skill contract expects min_confidence=0.7.
+            # The bridge only OBSERVES the violation, never injects the value.
+            if name in ("laya_predict", "laya_predict_batch", "laya_predict_long") \
+                    and translated_args.get("min_confidence") is None:
+                logger.warning(f"⚠️ [POLICY] '{name}': min_confidence absent "
+                               "(skill contract expects 0.7); laya default applies.")
             logger.info(f"🚀 [EXEC] Tool: {name} (ID: {request_id}) | {args} -> {translated_args}")
             if asyncio.iscoroutinefunction(fn):
                 result = await fn(**translated_args)
