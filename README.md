@@ -94,30 +94,22 @@ The shipped checkpoints work zero-shot, but fine-tuning on decisions from your o
 
 **[nandhakishorm.github.io/laya](https://nandhakishorm.github.io/laya/)**: guides for [prediction hooks](https://nandhakishorm.github.io/laya/hooks/), [schema-driven decisions](https://nandhakishorm.github.io/laya/structured/), [Docker](https://nandhakishorm.github.io/laya/docker/) and [LangChain and LangGraph](https://nandhakishorm.github.io/laya/langchain/), plus a full [API reference](https://nandhakishorm.github.io/laya/reference/).
 
-## What's new in 0.4.17
+## What's new in 0.4.22
 
-* **Vietnamese stops routing to the English checkpoint.** Its tone-marked vowels now count as
-  non-English diacritics. "Cảm ơn bạn nhiều nhé" scored a diacritic rate of 0.0 and read as
-  English. Fixed in `laya/lang.py` and carried into all six ports: TypeScript, Rust and .NET
-  directly, and the Java, Go and C++ tables re-recorded from the same source (#1392).
-* **A deciding window keeps its attribution after end hooks.** `predict_long` attributed answers
-  by position, so an end hook that reordered results reported the wrong token span without
-  saying so (#1369).
-* **`RemoteRouter` identifies itself, and the User-Agent is configurable.** The urllib default was
-  rejected outright by a Cloudflare browser-integrity rule in front of a hosted `laya-serve`,
-  before authentication (#1396).
-* **Ten more inputs are refused where they enter.** A `--questions` path that is a directory, a
-  UTF-8 BOM written by Notepad or Excel, a probability too wide for a double, an incomparable
-  `target_error`, a tool `choice` sent as an array, a short batch reply, an agent with no
-  tokenizer, a drive-anchored digest path and a bad `LAYA_MAX_LOADED` are each a named error
-  rather than a crash or a silent wrong answer (#1372, #1394, #1397, #1398, #1400, #1401, #1403,
-  #1404, #1405, #1406). A SHA-256 pin that is not a map is refused instead of verifying nothing
-  (#1402).
-* **The ports gain per-language temperatures, calibration files and a Go router.** `.NET` and Rust
-  take `lang_temperatures` plus per-call `lang`, `max_len` and `head_max_len` (#1370, #1371) and
-  .NET reads calibration files (#1384); Go gains the router model lifecycle, per-checkpoint
-  SHA-256 pins and routed inference (#1374, #1379). A C++ foundation starts, generated from the
-  same tables as Go (#1399, #1407).
+* **A guardrail confidence can no longer fall outside [0, 1].** `jev_confidence` accepts
+  unnormalised weights, and individually finite ones can still sum to infinity; dividing by that
+  sum turned every weight into zero, so two equally weighted choices reported -1.0 for a `choice`
+  and full confidence for a `score`. A common scale now cancels before the division, which is what
+  the docstring already promised the range was (#1442).
+* **Large and deeply nested states are flattened lazily.** Language detection reads at most the
+  first 4000 characters, but the walk materialised every leaf first; it now stops as soon as the
+  budget is met, which is about 20x faster on a 500 KB multi-turn state (#1448).
+* **`laya-ts` counts and cuts code points, like Python.** The diacritic rate divided by UTF-16
+  units, so two emoji could flip a state onto the English checkpoint that Python keeps off it, and
+  the 4000-character budgets could split a surrogate pair in half (#1445, #1446).
+* **`laya-ts` honours per-request token budgets in `Router.predictBatch`.** The grouping already
+  separated requests by budget and `decideBatch` already passed them; the Router never read them,
+  so a batch encoded at the checkpoint default (#1441).
 
 Earlier releases are in the [GitHub releases](https://github.com/NandhaKishorM/laya/releases).
 
@@ -752,6 +744,8 @@ curl -s localhost:8000/v1/systemone -H 'content-type: application/json' -d '{
 }'
 ```
 
+Questions in that request share the one `state`. Each is answered against the whole serialized state, so an instruction that names a record (`rows[i]`) still sees every record in it. One answer per record means one state per record, sent as `states` to `POST /v1/systemone/batch`. A state that does not fit the token room the questions leave is truncated before inference, and the server logs the dropped state tokens. The full response reports the same cut on `usage` (`truncated`, `state_tokens_dropped`, `truncated_questions`); `LAYA_JEV_STRICT=1` omits those fields, and the log line is the signal that remains.
+
 To evaluate multiple states in a single call, send a `states` array to `POST /v1/systemone/batch` (capped at 64 states; a batch larger than `LAYA_MAX_BATCH_TOKENS` is split across several forward passes rather than refused):
 
 ```bash
@@ -765,7 +759,7 @@ curl -s localhost:8000/v1/systemone/batch -H 'content-type: application/json' -d
 }'
 ```
 
-The endpoint shares forward passes via `Router.predict_batch` and returns an array of `results` in matching order along with aggregated `total_usage`.
+The endpoint shares forward passes via `Router.predict_batch` and returns an array of `results` in matching order along with aggregated `total_usage`. Each entry of `states` is its own context, which is the per-record call: a question on `/v1/systemone` sees the whole shared state, even when its text names `rows[i]`. When any result dropped state tokens, the server logs one warning for the batch — which results were cut, and how many tokens each lost — rather than one line per answer.
 
 
 Configuration is by environment variable: `LAYA_HOST`, `LAYA_PORT`,
@@ -796,8 +790,9 @@ When publishing the server under a reverse-proxy prefix such as `/laya`, set
 `LAYA_ROOT_PATH=/laya`. The proxy should strip that prefix before forwarding;
 the setting controls FastAPI-generated URLs and leaves the internal routes unchanged.
 
-Three things differ from Jev when you port a client:
+Four things differ from Jev when you port a client:
 
+* **One shared context.** One `/v1/systemone` request is one state, and every question is decided on that whole state. Several records packed into it, with questions aimed at `rows[i]`, still share that context. Per-record answers are `states` on `/v1/systemone/batch`, one state per record. A state larger than the token room is truncated, and `laya-serve` logs the dropped tokens; under `LAYA_JEV_STRICT` that log is where the cut stays visible.
 * **Options per question.** A question's options share the checkpoint's option budget, `head_max_len` (192 tokens on `laya`, 256 on the other two), not Jev's cap of 255 options. In addition, the HTTP server (`laya.serve`) enforces an amplification guard of at most 100 choice options per question (`MAX_CHOICE_OPTIONS = 100`, rejected with 413 before inference). Once options overflow the token budget, around 20 options with a short description each, every option is trimmed to fit, so long or similar labels can reach the model reading the same ([Where Jev leads](#where-jev-leads)). Once they no longer fit the window at all, the library rejects the request with 422. For more candidates, narrow them first with `predict_shortlist` ([Honest limits](#honest-limits)).
 * **Score levels.** Every level needs a description. A `null` level is rejected with 422 rather than scored and echoed back in `legend`.
 * **`confidence`** on `choice` and `score` answers is 1 minus normalised entropy, a measure of how concentrated the distribution is, not Jev's `(n·p_max − 1)/(n − 1)`. A threshold carried over from Jev does not transfer. For one calibrated number on every question type, gate on `answer_confidence`, the probability of the reported answer. Both values shift with the number of options, so fit and validate any cutoff on held-out data at the option counts your workload uses ([#394](https://github.com/NandhaKishorM/laya/issues/394)).
@@ -1039,7 +1034,7 @@ else:
 
 A threshold is a policy you choose from measured accuracy at that coverage on your data, not a property of the model. Both checkpoints are over-confident as shipped and `laya-multilingual` has no fitted temperatures at all, so fit them before relying on these numbers — see [Calibration](#calibration) below, and the [fine-tuning notebook](https://github.com/NandhaKishorM/laya/blob/main/notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb) for the fitting loop itself. Then pick the point where the errors you accept are ones you can live with. Confidence orders decisions; it does not establish that a decision is correct.
 
-A threshold also depends on the autocast dtype. On CUDA at compute capability 8 or above the runtime uses the checkpoint's `amp_dtype`, which is bf16 for all three shipped checkpoints. On the fixed set from `benchmarks/parity_fast.py` (60 states, 288 questions per checkpoint, RTX 2000 Ada) bf16 moves a probability by up to 0.073 against the fp32 forward and flips 3 of 864 argmaxes across the three checkpoints; fp16 stays within 0.019 and flips none, at the same latency. `LAYA_CUDA_AMP=fp16` selects fp16 and `LAYA_CUDA_AMP=bf16` selects bf16 (`LAYA_CPU_AMP=bf16` is the CPU counterpart). MPS autocasts in fp16 too, but the overhead dominates on a single small row, so there it engages only once a call reaches `mps_amp_min_rows` rows -- 5 by default, `LAYA_MPS_AMP_MIN_ROWS` to move it; a value that does not parse falls back to 5 and anything below 1 is clamped to 1. On MPS, `agent.dtype` is the autocast target, so it says float16 even when every call stays below the gate and runs in fp32; `agent.dtype_for(rows)` returns the precision a call with that many rows runs in. Fit and measure a threshold in the dtype you serve with.
+A threshold also depends on the autocast dtype. On CUDA at compute capability 8 or above the runtime uses the checkpoint's `amp_dtype`, which is bf16 for all three shipped checkpoints. On the fixed set from `benchmarks/parity_fast.py` (60 states, 288 questions per checkpoint, RTX 2000 Ada) bf16 moves a probability by up to 0.073 against the fp32 forward and flips 3 of 864 argmaxes across the three checkpoints; fp16 stays within 0.019 and flips none, at the same latency. `LAYA_CUDA_AMP=fp16` selects fp16, `LAYA_CUDA_AMP=bf16` selects bf16 and `LAYA_CUDA_AMP=fp32` turns autocast off for the full-precision forward those numbers are measured against (`LAYA_CPU_AMP=bf16` is the CPU counterpart). MPS autocasts in fp16 too, but the overhead dominates on a single small row, so there it engages only once a call reaches `mps_amp_min_rows` rows -- 5 by default, `LAYA_MPS_AMP_MIN_ROWS` to move it; a value that does not parse falls back to 5 and anything below 1 is clamped to 1. On MPS, `agent.dtype` is the autocast target, so it says float16 even when every call stays below the gate and runs in fp32; `agent.dtype_for(rows)` returns the precision a call with that many rows runs in. Fit and measure a threshold in the dtype you serve with.
 
 ### Opt-in abstention: `min_confidence`
 

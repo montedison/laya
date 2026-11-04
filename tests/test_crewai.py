@@ -285,6 +285,12 @@ _BAD_DISTRIBUTIONS = {
     "value_str": {"probabilities": {"0": 0.1, "1": 0.1, "2": "high", "3": 0.4}, "score": 1.5},
     "value_none": {"probabilities": {"0": 0.1, "1": 0.1, "2": None, "3": 0.4}, "score": 1.5},
     "value_bool": {"probabilities": {"0": 0.1, "1": 0.1, "2": True, "3": False}, "score": 1.5},
+    "value_nan_string": {"probabilities": {"0": 0.1, "1": 0.1, "2": "NaN", "3": 0.4}, "score": 1.5},
+    "value_inf_string": {"probabilities": {"0": 0.1, "1": 0.1, "2": "Infinity", "3": 0.4}, "score": 1.5},
+    "value_neg_inf_string": {"probabilities": {"0": 0.1, "1": 0.1, "2": "-Infinity", "3": 0.4}, "score": 1.5},
+    "value_overflow_string": {"probabilities": {"0": 0.1, "1": 0.1, "2": "1e10000", "3": 0.4}, "score": 1.5},
+    "value_wide_int": {"probabilities": {"0": 0.1, "1": 0.1, "2": 10 ** 1000, "3": 0.4}, "score": 1.5},
+    "sum_overflow": {"probabilities": {"0": 0.1, "1": 0.1, "2": 1e308, "3": 1e308}, "score": 1.5},
 }
 for _label, _ans in _BAD_DISTRIBUTIONS.items():
     try:
@@ -294,7 +300,9 @@ for _label, _ans in _BAD_DISTRIBUTIONS.items():
         check_true("guardprob/%s_uses_score_fallback" % _label, False, "%s: %s" % (type(_e).__name__, _e))
 
 # A bool score is not a level, and a non-numeric score is not one either: both read as 0.0.
-for _label, _bad_score in (("bool_score_is_zero", True), ("nonnumeric_score_is_zero", "1.5")):
+for _label, _bad_score in (("bool_score_is_zero", True), ("nonnumeric_score_is_zero", "1.5"),
+                           ("nan_score_is_zero", float("nan")), ("inf_score_is_zero", float("inf")),
+                           ("neg_inf_score_is_zero", float("-inf")), ("wide_int_score_is_zero", 10 ** 1000)):
     try:
         check("guardprob/" + _label, score_violation_probability({"score": _bad_score}, 4), 0.0)
     except Exception as _e:
@@ -907,6 +915,40 @@ for _body, _label in _CREWAI_NESTED_ROUTE:
                        "Malformed decision response" in str(exc))
         except Exception as exc:
             check_true("nested/%s/route is RuntimeError" % _label, False, type(exc).__name__)
+
+# A `choice` may name an index the crew does not have. `chosen_key` is remote JSON and `agents` is
+# the caller's list, and the code parsed `agent_N` straight into `agents[N]`: `agent_9` raised a
+# bare IndexError out of the routing decision, and `agent_-1` wrapped to the LAST agent -- a route
+# no caller asked for and nothing in the decision names. `tools.py:493` answers an unknown decision
+# by name instead of raising, so the index range is checked the same way here.
+_CREWAI_CHOICE_INDEX = [
+    "agent_4",      # one past the end of the four-agent crew
+    "agent_9",      # far past the end
+    "agent_-1",     # would wrap to the last agent
+    "agent_-99",    # far before the start
+]
+for _choice in _CREWAI_CHOICE_INDEX:
+    with patch("urllib.request.build_opener") as _m:
+        _m.return_value.open.return_value = DummyHTTPResponse(
+            {"answers": {"delegation": {"choice": _choice, "answer_confidence": 0.95}}})
+        try:
+            _d = LayaCrewRouter(base_url="http://localhost:8000").route("Analyze codebase", agents)
+            check_true("choice-index/%s/route raises" % _choice, False,
+                       "no error raised (routed to index %r)" % (_d.agent_index,))
+        except RuntimeError as exc:
+            check_true("choice-index/%s/route malformed" % _choice,
+                       "Malformed decision response" in str(exc))
+            check_true("choice-index/%s/route names the choice" % _choice, _choice in str(exc))
+            check_true("choice-index/%s/route names the crew size" % _choice, "4-agent" in str(exc))
+        except Exception as exc:
+            check_true("choice-index/%s/route is RuntimeError" % _choice, False, type(exc).__name__)
+
+# The last real index still routes: the guard is a range check, not a rejection of the highest one.
+with patch("urllib.request.build_opener") as _m:
+    _m.return_value.open.return_value = DummyHTTPResponse(
+        {"answers": {"delegation": {"choice": "agent_3", "answer_confidence": 0.95}}})
+    check("choice-index/last agent still routes",
+          LayaCrewRouter(base_url="http://localhost:8000").route("Analyze codebase", agents).agent_index, 3)
 
 _CREWAI_NESTED_SCREEN = [
     ({"answers": []}, "answers-list"),

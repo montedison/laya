@@ -127,7 +127,13 @@ from laya.confidence import check_min_confidence, flag_low_confidence  # noqa: E
 for valid in (0.0, 0.5, 1.0, 0, 1, 0.85):
     check("min_confidence/valid %.2f" % valid, check_min_confidence(valid), float(valid))
 
-for invalid in (True, False, -0.01, 1.01, -1.0, 2.0, float("nan"), float("inf"), float("-inf"), "0.5", None, [0.5]):
+for invalid in (True, False, -0.01, 1.01, -1.0, 2.0, float("nan"), float("inf"), float("-inf"), "0.5", None, [0.5],
+                # A JSON integer wider than a double is the third way a client's threshold is not a
+                # number: `math.isfinite` raises `OverflowError` rather than answering "not finite",
+                # so this walked out of `check_min_confidence` -- and out of `validate_min_confidence`,
+                # whose docstring says it "only wraps its ValueError as a clean invalid_min_confidence
+                # the client can read" -- as an interpreter error instead of the refusal.
+                10 ** 400, -(10 ** 400)):
     try:
         check_min_confidence(invalid)
         FAIL.append("min_confidence/should reject %r" % (invalid,))
@@ -245,6 +251,11 @@ odd = [{"answers": {
     # None is not None is also False), so nothing else pinned this down.
     "q_nan_entropy": {"type": "choice", "confidence": float("nan")},
     "q_bool_entropy": {"type": "choice", "confidence": True},
+    # Both readers above end in `math.isfinite`, and a 400-digit integer is what JSON's unbounded
+    # grammar hands them: the gate crashed instead of reporting `unevaluated`, from the same field
+    # it is defined against and from the entropy fallback that already leaked a NaN.
+    "q_overflow": {"type": "choice", "answer_confidence": 10 ** 400},
+    "q_overflow_entropy": {"type": "choice", "confidence": 10 ** 400},
     "q_fine": {"type": "choice", "answer_confidence": 0.99},
 }}]
 apply_confidence_gate(odd, 0.80)
@@ -2229,7 +2240,7 @@ for _fn in (test_tl_kernels_drops_the_wrong_row_claim,
 # --------------------------------------- DecisionResult's docstring must split confidence by question type
 # `laya/structured.py`'s `DecisionResult` closed with "confidence keeps the **normalized-entropy
 # value** it has always had, because that is a different quantity on a scale that depends on the
-# label count". `Agent._decode_answers` (`laya/agent.py:1369-1398`) uses two different formulas:
+# label count". `Agent._decode_answers` (`laya/agent.py:1394-1423`) uses two different formulas:
 #   * `choice` and `score`  ->  `confidence_from_probs(p, k)` = `1 - H(p) / log(k)`
 #   * `noul`                ->  `max(p_true, 1 - p_true)`  (its own comment: "identical here:
 #                               over two options `max(p_true, 1 - p_true)` is `max(p)`")
@@ -2443,6 +2454,35 @@ for _name, _answer, _want in (
     _got = jev_confidence(_answer)
     check_true("jev_confidence/%s" % _name, _got is not None and abs(_got - _want) < 1e-9,
                "got %r, want %r" % (_got, _want))
+
+# --- finite total overflow: a common scale must not change the confidence -----------------
+# Each entry below is finite and non-negative. The public helper accepts unnormalised weights,
+# but their sum can still overflow: dividing by infinity turns them all into zeros, reporting
+# negative choice confidence or maximum score confidence for an uncertain distribution.
+_JEV_FINITE_SCALE_CASES = (
+    ("overflow-uniform", (1e308, 1e308), (1.0, 1.0)),
+    ("overflow-skewed", (1e308, 8e307), (1.0, 0.8)),
+    ("overflow-with-zero", (0.0, 1e308, 1e308), (0.0, 1.0, 1.0)),
+    ("overflow-three", (1e308, 5e307, 5e307), (1.0, 0.5, 0.5)),
+    ("overflow-integers", (10 ** 308, 10 ** 308), (1.0, 1.0)),
+    ("overflow-numeric-strings", ("1e308", "1e308"), (1.0, 1.0)),
+    ("small-normal", (1e-308, 8e-309), (1.0, 0.8)),
+    ("smallest-subnormal", (5e-324, 5e-324), (1.0, 1.0)),
+    ("zero-total", (0.0, 0.0), (1.0, 1.0)),
+)
+for _name, _weights, _reference in _JEV_FINITE_SCALE_CASES:
+    for _build in (_choice, _score):
+        _answer = _build(*_weights)
+        _before = copy.deepcopy(_answer)
+        _got = jev_confidence(_answer)
+        _want = jev_confidence(_build(*_reference))
+        check_true("jev_finite_scale/%s/%s" % (_answer["type"], _name),
+                   _got is not None and abs(_got - _want) < 1e-9,
+                   "got %r, want %r" % (_got, _want))
+        check_true("jev_finite_range/%s/%s" % (_answer["type"], _name),
+                   _got is not None and 0.0 <= _got <= 1.0, repr(_got))
+        check("jev_finite_input/%s/%s" % (_answer["type"], _name), _answer, _before)
+# --- end finite total overflow -------------------------------------------------------------
 
 # Score levels are read in numeric order, not string order: "10" sorts before "2" as text.
 _levels = {str(i): 0.0 for i in range(11)}
