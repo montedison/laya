@@ -140,7 +140,9 @@ await router.withHooks([auditHook], () => router.predict(state, questions)); // 
 
 // a start hook may rewrite ctx.states / ctx.questions, or serve a cached result:
 const cache = { onPredictStart(ctx) { const hit = lookup(ctx.states[0]); if (hit) ctx.skip([hit]); } };
-// an onRoute hook may replace ctx.decision (e.g. pin a checkpoint)
+// an onRoute hook may replace ctx.decision (e.g. pin a checkpoint). `predictBatch` groups by the
+// resolved checkpoint, so a pin that spells it as an alias ("ml") shares that checkpoint's batch:
+const pin = { onRoute(ctx) { if (isTicket(ctx.states[0])) ctx.decision = { ...ctx.decision, model: "ml" }; } };
 
 // subclass BaseHook to override only the events you need:
 class MetricsHook extends BaseHook {
@@ -309,6 +311,10 @@ const routed = await router.predictBatch(requests, 32); // == router.predictMany
 const budgeted = await router.predictBatch([
   { state: "ticket", questions, maxLen: 64, headMaxLen: 16 },
 ]);
+// Abstention is the same opt-in knob predict takes (`minConfidence`, or Python's
+// `min_confidence`): answers below it come back marked `low_confidence: true`, before each
+// request's onPredictEnd runs, so an audit hook sees what the caller sees. Unset writes nothing.
+const gated = await router.predictBatch(requests, null, { minConfidence: 0.8 });
 // Per-call hooks are composed like predict: installed hooks first, then this list,
 // then onPredictStart / onPredictEnd. null and [] add nothing. hooksRaise overrides
 // the Router's policy for this call. The list runs once per request, including onRoute.
