@@ -58,6 +58,35 @@ def test_list_form_choice_and_unknown_type():
         lv._to_vega_questions({"k": {"type": "ranking", "instructions": "x"}})
 
 
+def test_a_malformed_question_is_refused_by_layas_own_check():
+    # the translation reads `q["type"]` and `q["instructions"]` directly: a missing key used to
+    # surface as a bare `KeyError: 'type'` and a non-dict as `TypeError: string indices must be
+    # integers`, naming neither the question nor what to fix, on fit as well as predict.
+    # vega's own unknown-type message already names the question; the check changes only the wording
+    with pytest.raises(ValueError):
+        lv._to_vega_questions({"dept": {"type": "ranking", "instructions": "x"}})
+    with pytest.raises(ValueError, match=r"question 'dept': definition must be a dict"):
+        lv._to_vega_questions({"dept": "the billing team"})
+    with pytest.raises(ValueError, match="question 'dept': no 'instructions'"):
+        lv._to_vega_questions({"dept": {"type": "choice", "criteria": Q["dept"]["criteria"]}})
+    with pytest.raises(ValueError, match="question 'urgency': a score question takes 'criteria'"):
+        lv._to_vega_questions({"urgency": {"type": "score", "instructions": "x"}})
+    with pytest.raises(ValueError, match=r"question 'dept': a choice question takes 'criteria'"):
+        lv._to_vega_questions({"dept": {"type": "choice", "instructions": "x"}})
+
+
+def test_the_question_check_keeps_every_shape_the_translation_supports():
+    vq = lv._to_vega_questions(Q)
+    assert vq["churn"]["criteria"] == {"false": "stays", "true": "threatens to leave"}, "noul labels"
+    assert vq["urgency"]["criteria"] == ["not urgent", "soon", "blocking"], "score levels"
+    assert vq["dept"]["type"] == "choice" and vq["dept"]["criteria"] == Q["dept"]["criteria"]
+    bare = {"type": "noul", "instructions": "x"}
+    assert lv._to_vega_questions({"k": bare})["k"] == {"instructions": "x", "type": "boolean"}
+    ints = {"type": "choice", "instructions": "x", "criteria": [1, 2]}
+    assert lv._to_vega_questions({"k": ints})["k"]["criteria"] == {"1": None, "2": None}, \
+        "laya allows number labels; vega stringifies them into answer keys"
+
+
 def test_labels_for_each_type():
     assert lv._labels_for(Q["churn"]) == ["false", "true"]
     assert lv._labels_for(Q["urgency"]) == ["0", "1", "2"]
@@ -72,6 +101,40 @@ def test_gold_label_accepts_every_laya_answer_shape():
     assert lv._gold_label(Q["urgency"], "blocking") == "2"
     assert lv._gold_label(Q["dept"], {"probabilities": {"billing": 0.1, "technical": 0.9}}) == "technical"
     assert lv._gold_label(Q["dept"], {"label": "other"}) == "other"
+
+
+def test_gold_label_reads_a_yes_no_number_the_way_the_fine_tune_does():
+    # `str(1.0)` is "1.0", which is not one of the true-words, so a float yes/no used to train the
+    # head on the false side of its own label. `target_from_expected` takes 1 and 1.0 as true.
+    assert lv._gold_label(Q["churn"], 1.0) == "true"
+    assert lv._gold_label(Q["churn"], 0.0) == "false"
+    assert lv._gold_label(Q["churn"], "YES") == "true"
+    assert lv._gold_label(Q["churn"], {"label": 1}) == "true"
+    for unreadable in ("maybe", "", None, 0.5, 2, "11", {"probabilities": {}}):
+        with pytest.raises(ValueError, match="noul gold"):
+            lv._gold_label(Q["churn"], unreadable)
+
+
+def test_gold_label_refuses_a_score_level_the_question_does_not_have():
+    assert lv._gold_label(Q["urgency"], "2") == "2"
+    assert lv._gold_label(Q["urgency"], 2.0) == "2"
+    for outside in (9, "9", -1):
+        with pytest.raises(ValueError, match=r"level index in \[0, 2\]"):
+            lv._gold_label(Q["urgency"], outside)
+    with pytest.raises(ValueError, match="one whole level"):
+        lv._gold_label(Q["urgency"], 1.5)           # used to truncate to level 1
+    with pytest.raises(ValueError, match="one of \\['not urgent', 'soon', 'blocking'\\]"):
+        lv._gold_label(Q["urgency"], "urgent")      # used to raise list.index(x): x not in list
+    with pytest.raises(ValueError, match="not True"):
+        lv._gold_label(Q["urgency"], True)          # used to read as level 1
+
+
+def test_gold_label_refuses_a_choice_label_the_question_never_offered():
+    assert lv._gold_label(Q["dept"], "other") == "other"
+    assert lv._gold_label(Q["dept"], {"probabilities": {"billing": 1.0}}) == "billing"
+    for unknown in ("nope", "Billing", None, True, 1):
+        with pytest.raises(ValueError, match="choice gold"):
+            lv._gold_label(Q["dept"], unknown)
 
 
 # ----------------------------------------------------------------------------- the fold
@@ -108,6 +171,34 @@ def test_fold_confidence_is_entropy_and_answer_confidence_is_max_p():
                  {"type": "choice", "instructions": "x", "criteria": {"a": None, "b": None}})
     assert a["confidence"] == pytest.approx(0.0, abs=1e-6)        # an even split has no information
     assert a["answer_confidence"] == pytest.approx(0.9)            # what the engine reported
+
+
+def test_fold_refuses_an_answer_number_that_is_not_a_finite_number():
+    # `float()` reads True as 1.0 and lets nan/inf through, and every comparison against a NaN
+    # answers False: the answer used to clear a min_confidence gate of 0.9 and leave as route
+    # "auto", which is the one field this module tells callers to gate on.
+    for unreadable in (float("nan"), float("inf"), float("-inf"), True, "high", None, 10 ** 400):
+        with pytest.raises(ValueError, match="the probability of 'billing'"):
+            lv._fold(_engine_answer(probs={"billing": unreadable, "technical": 0.0}), Q["dept"])
+    for unreadable in (float("nan"), float("inf"), True, "high"):
+        with pytest.raises(ValueError, match="the engine's confidence"):
+            lv._fold(_engine_answer(probs={"billing": 0.5, "technical": 0.5}, confidence=unreadable),
+                     Q["dept"])
+    # a numeric string is a number here, as `float()` has always read it on every laya path
+    readable = lv._fold(_engine_answer(probs={"billing": 0.5, "technical": 0.5}, confidence="0.9"),
+                        Q["dept"])
+    assert readable["answer_confidence"] == pytest.approx(0.9)
+    with pytest.raises(ValueError, match="the engine's score"):
+        lv._fold(_engine_answer(probs={"0": 0.5, "1": 0.5}, score=float("nan")), Q["urgency"])
+    with pytest.raises(ValueError, match="the engine's expected score"):
+        lv._fold(_engine_answer(probs={"0": 0.5, "1": 0.5}, expected_score=float("nan")), Q["urgency"])
+    # the engine answers in numpy float32, which is a real number and must keep working
+    import numpy as np
+
+    ok = lv._fold(_engine_answer(probs={"billing": np.float32(0.7), "technical": np.float32(0.3),
+                                        "other": np.float32(0.0)}, choice="billing"), Q["dept"])
+    assert ok["probabilities"] == {"billing": 0.7, "technical": 0.3, "other": 0.0}
+    assert ok["confidence"] == pytest.approx(0.444, abs=1e-4)
     assert lv._entropy_confidence({"a": 1.0, "b": 0.0}) == 1.0
 
 
@@ -146,7 +237,6 @@ def test_route_is_auto_only_when_everything_agrees():
 
 @pytest.mark.parametrize("field, value, word", [
     ("abstain", True, "abstains"),
-    ("unbound", True, "unbound"),
     ("prediction_set", ["x", "y"], "holds 2 options"),
 ])
 def test_route_reviews_on_each_engine_signal(field, value, word):
@@ -155,6 +245,13 @@ def test_route_reviews_on_each_engine_signal(field, value, word):
     folded[field] = value
     r = a._route({}, folded, None)
     assert r["route"] == "review" and word in r["route_reason"]
+
+
+def test_unbound_is_reported_but_does_not_route():
+    """It fired on 71% of in-domain banking77 rows with the published threshold."""
+    a = _bare_agent()
+    folded = {"abstain": False, "unbound": True, "prediction_set": ["x"], "answer_confidence": 0.8}
+    assert a._route({}, folded, None)["route"] == "auto"
 
 
 def test_route_prefers_a_fitted_band_and_reviews_unvouched_heads():
@@ -230,6 +327,95 @@ def test_vega_agent_is_exported_and_is_an_agent_subclass():
     assert "VegaAgent" in laya.__all__
 
 
+# ----------------------------------------------------------------- the hook lifecycle
+def _hook_agent(monkeypatch, answer, calls):
+    a = object.__new__(lv.VegaAgent)
+    a.model_id = "vega-test"
+    a.hooks = []
+    a.hooks_raise = True
+    a.hooks_timeout = None
+
+    def fake_decide(self, state, questions, **kw):
+        calls.append((state, questions))
+        return answer
+
+    monkeypatch.setattr(lv.VegaAgent, "_decide", fake_decide)
+    return a
+
+
+def test_predict_runs_the_hook_lifecycle(monkeypatch):
+    answer = {"answers": {}, "usage": {"input_tokens": 3, "output_tokens": 0}, "modality": "text"}
+    calls, events = [], []
+    a = _hook_agent(monkeypatch, answer, calls)
+
+    class Probe:
+        def on_predict_start(self, ctx):
+            events.append(("start", ctx.states, dict(ctx.questions)))
+
+        def on_predict_end(self, ctx):
+            events.append(("end", ctx.results))
+
+        def on_error(self, ctx):
+            events.append(("error", ctx.error))
+
+    q = {"dept": {"type": "choice", "instructions": "x", "criteria": ["a", "b"]}}
+    out = a.predict("s", q, hooks=Probe())
+    assert out is answer
+    assert [e[0] for e in events] == ["start", "end"]
+    assert events[0][1] == "s" and events[0][2] == q, "the hook sees the call's state and questions"
+    assert events[1][1] is answer, "the end hook sees the finished answer"
+    assert calls == [("s", q)]
+
+
+def test_a_start_hook_can_short_circuit_and_rewrite_questions(monkeypatch):
+    answer = {"answers": {}, "usage": {"input_tokens": 3, "output_tokens": 0}, "modality": "text"}
+    calls = []
+    a = _hook_agent(monkeypatch, answer, calls)
+    other = {"dept": {"type": "noul", "instructions": "will they churn?"}}
+    given = {"dept": {"type": "noul", "instructions": "x"}}
+
+    class Skipper:
+        def on_predict_start(self, ctx):
+            ctx.questions = other
+            ctx.skip({"answers": {}, "cached": True})
+
+    assert a.predict("s", given, hooks=Skipper()) == {"answers": {}, "cached": True}
+    assert calls == [], "skip() short-circuits the decision"
+
+    class Rewriter:
+        def on_predict_start(self, ctx):
+            ctx.questions = other
+
+    a.predict("s", given, hooks=Rewriter())
+    assert calls and calls[0][1] is other, "the rewritten questions are what decide on"
+
+
+def test_a_failing_hook_follows_the_raise_policy(monkeypatch):
+    answer = {"answers": {}, "usage": {"input_tokens": 3, "output_tokens": 0}, "modality": "text"}
+    calls, events = [], []
+    a = _hook_agent(monkeypatch, answer, calls)
+
+    class Boom:
+        def on_predict_start(self, ctx):
+            raise RuntimeError("boom")
+
+        def on_error(self, ctx):
+            events.append("error")
+
+        def on_predict_end(self, ctx):
+            events.append("end")
+
+    q = {"dept": {"type": "noul", "instructions": "x"}}
+    with pytest.raises(RuntimeError, match="boom"):
+        a.predict("s", q, hooks=Boom())
+    assert events == ["error", "end"], "on_error fired, then on_predict_end on the failure path"
+    events.clear()
+    with pytest.raises(RuntimeError, match="boom"):
+        a.predict("s", q, hooks=Boom(), hooks_raise=True)
+    assert a.predict("s", q, hooks=Boom(), hooks_raise=False) is answer, \
+        "hooks_raise=False warns and continues"
+
+
 # ----------------------------------------------------------------------------- with weights
 needs_model = pytest.mark.skipif(
     not MODEL_TESTS, reason="set LAYA_VEGA_TESTS=1 with vegaml installed (downloads the 0.8B reader)")
@@ -274,7 +460,7 @@ def test_batch_long_and_thresholds(agent):
     lg = agent.predict_long(STATE * 20, Q)
     assert lg["usage"]["windows"] == 1 and lg["long"]["applied"] is False
     assert lg["usage"]["input_tokens"] > 500
-    assert agent.thresholds()["policy"] == "conformal set + abstain + unbound"
+    assert agent.thresholds()["policy"] == "conformal set + abstain"
 
 
 def _synthetic_rows(n=28):
@@ -349,6 +535,27 @@ def _clip(tmp_path, name, audio_src, video_src="color=c=orange:s=160x120:d=3"):
                     "-f", "lavfi", "-i", audio_src, "-t", "3", "-shortest", "-pix_fmt", "yuv420p", out],
                    check=True)
     return out
+
+
+def test_probe_survives_a_banner_that_reports_no_duration(monkeypatch):
+    # an elementary .h264 has no container duration, so ffmpeg banners "Duration: N/A" and the
+    # fallback used to crash the three-way unpack. 0.0 is what an absent `format.duration`
+    # already gets on the ffprobe path. Weight-free: ffprobe is hidden and the banner is fed in.
+    import types
+
+    from laya import video as v
+
+    banner = (b"Input #0, h264, from 'clip.h264':\n"
+              b"  Duration: N/A, bitrate: N/A\n"
+              b"  Stream #0:0: Video: h264 (High), yuv420p, 64x64, 10 fps\n")
+    monkeypatch.setattr(v.shutil, "which", lambda name: "/usr/bin/true" if name == "ffmpeg" else None)
+    monkeypatch.setattr(v.subprocess, "run",
+                        lambda args, **kw: types.SimpleNamespace(returncode=1, stdout=b"", stderr=banner))
+    assert v.probe("clip.h264") == {"duration_s": 0.0, "has_audio": False, "has_video": True}
+    timed = banner.replace(b"Duration: N/A", b"Duration: 00:01:02.50")
+    monkeypatch.setattr(v.subprocess, "run",
+                        lambda args, **kw: types.SimpleNamespace(returncode=1, stdout=b"", stderr=timed))
+    assert v.probe("clip.h264")["duration_s"] == 62.5
 
 
 @needs_ffmpeg
@@ -483,6 +690,19 @@ def test_jsonl_rows_load_as_given(tmp_path):
     assert [r["gold"]["team"] for r in rows] == ["hr", "pr"]
 
 
+def test_a_gold_keyed_to_no_question_id_is_refused_not_dropped():
+    # load_rows refuses an unknown CSV column; the dict form of the same mistake used to be
+    # filtered out by `if qid in qs`, so fit reported success on labels that trained nothing.
+    a = object.__new__(lv.VegaAgent)
+    rows = [{"state": "s", "questions": ROUTING_Q, "gold": {"team": "hr", "dept": "billing"}}]
+    with pytest.raises(ValueError, match=r"gold key\(s\) \['dept'\] match no question id"):
+        a._examples(rows, None)
+    with pytest.raises(ValueError, match=r"gold key\(s\) \['dept', 'x'\]"):
+        a._examples([{"state": "s", "gold": {"dept": "billing", "x": "y"}}], ROUTING_Q)
+    examples, sheet = a._examples([{"state": "s", "gold": {"team": "hr"}}], ROUTING_Q)
+    assert examples[0][1] == {"team": "hr"}, "a gold naming only some of the questions still fits"
+
+
 @needs_model
 def test_fit_from_the_example_csv(agent):
     report = agent.fit(ROUTING_CSV, questions=ROUTING_Q, calibrate=True)
@@ -514,7 +734,9 @@ def test_split_holds_out_at_least_ten_rows_across_every_label():
 def test_fit_refuses_fewer_rows_than_the_minimum():
     a = object.__new__(lv.VegaAgent)
     a.folds = 5
-    rows = [{"state": "s%d" % i, "gold": {"team": "abcde"[i % 5], "urgency": "1"}} for i in range(30)]
+    # spread over the sheet's own five teams: `fit` reads every row's gold before it counts rows
+    teams = list(ROUTING_Q["team"]["criteria"])
+    rows = [{"state": "s%d" % i, "gold": {"team": teams[i % 5], "urgency": "1"}} for i in range(30)]
     with pytest.raises(ValueError, match="at least 35 labelled rows"):
         a.fit(rows, questions=ROUTING_Q)
     with pytest.raises(ValueError, match="at least 25 labelled rows"):
@@ -542,5 +764,89 @@ def test_an_unreachable_band_hands_the_route_to_the_conformal_rule():
     assert a._route(raw, single, None) == {"route": "review", "route_reason": "band: confidence 1.000 is below the 1.000 review line"}
 
 
+# -----------------------------------------------------------------------------
+# frame sampling: the times must be the ones the frames came from, weight-free
+
+def test_sample_frames_reports_the_time_each_frame_came_from(monkeypatch):
+    pytest.importorskip("PIL")
+    import io
+    from PIL import Image
+    from laya import video as v
+
+    buf = io.BytesIO()
+    Image.new("RGB", (2, 2)).save(buf, "PNG")
+    png = buf.getvalue()
+
+    def fake_run(args, what):
+        return png if float(args[4]) in (1.25, 6.25, 8.75) else b""   # t=3.75 yields nothing
+
+    monkeypatch.setattr(v, "_run", fake_run)
+    monkeypatch.setattr(v.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+
+    frames, times = v.sample_frames("unused.mp4", n=4, duration_s=10.0)
+    assert len(frames) == 3
+    assert [round(t, 3) for t in times] == [1.25, 6.25, 8.75]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ----------------------------------------------------------------------------- 0.4.29: policies
+class _Cal:
+    """The two things the helpers read off a vegaml Calibration."""
+
+    def __init__(self, labels):
+        self.questions = {"team": {"labels": labels, "type": "choice"}}
+
+    def apply(self, result):
+        out = dict(result)
+        out["answers"] = {q: dict(a, calibrated_by_test=True) for q, a in result["answers"].items()}
+        return out
+
+
+def test_an_option_the_policy_never_saw_skips_its_calibration():
+    cal = _Cal(["billing", "technical"])
+    raw = {"answers": {"team": {"probs": {"billing": 0.2, "technical": 0.3, "refunds": 0.5}},
+                       "urgent": {"probs": {"false": 0.4, "true": 0.6}}}}
+    stale = lv._stale_for_calibration(raw, cal)
+    assert stale == {"team": ["refunds"]}
+    done = lv._apply_calibration(raw, cal, stale)
+    assert "calibrated_by_test" not in done["answers"]["team"]
+    assert done["answers"]["urgent"]["calibrated_by_test"] is True
+    # a strict subset of the fitted options is padded and calibrated, as before
+    sub = {"answers": {"team": {"probs": {"billing": 1.0}}}}
+    assert lv._stale_for_calibration(sub, cal) == {}
+
+
+def test_the_guarded_head_records_its_residual():
+    import numpy as np
+
+    class _Head:
+        def __init__(self, *a, **k):
+            pass
+
+        def predict(self, x, allowed=None):
+            return {"a": 1.0}
+
+    head = lv._guarded_head_class(_Head)()
+    head.mu, head.sd, head.c = np.zeros(3, np.float32), np.ones(3, np.float32), np.zeros(3, np.float32)
+    head.P = np.array([[1.0], [0.0], [0.0]], np.float32)
+    head.predict(np.array([1.0, 0.0, 0.0]))
+    assert head.last_residual == 0.0
+    head.predict(np.array([0.0, 1.0, 0.0]))
+    assert abs(head.last_residual - 1.0) < 1e-6
+
+
+def test_a_record_past_the_limit_is_outbound():
+    a = _bare_agent()
+
+    class _V:
+        heads = {"team": (type("H", (), {"last_residual": 0.9})(), 0.8)}
+
+    a.vega, a._novelty = _V(), ("team", 0.7)
+    assert a._read_novelty() == {"residual": 0.9, "limit": 0.7, "question": "team"}
+    a._novelty = ("team", 0.95)
+    assert a._read_novelty() is None
+    a._novelty = None
+    assert a._read_novelty() is None

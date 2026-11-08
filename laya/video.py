@@ -92,8 +92,8 @@ def as_path(video) -> Tuple[str, Optional[str]]:
 
 
 def probe(path: str) -> dict:
-    """Duration in seconds and whether the clip has an audio stream, from ffprobe when it is
-    there and from ffmpeg's own banner when it is not."""
+    """Duration in seconds (0.0 when the tool reports none) and whether the clip has an audio
+    stream, from ffprobe when it is there and from ffmpeg's own banner when it is not."""
     _need_ffmpeg()
     ffprobe = shutil.which("ffprobe")
     if ffprobe is not None:
@@ -110,8 +110,15 @@ def probe(path: str) -> dict:
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("Duration:"):
-            h, m, s = line.split(",")[0].split("Duration:")[1].strip().split(":")
-            dur = int(h) * 3600 + int(m) * 60 + float(s)
+            # A stream with no container duration -- an elementary .h264, a live capture --
+            # banners "Duration: N/A". Leave 0.0, the same answer an absent `format.duration`
+            # gets on the ffprobe path, instead of crashing the unpack or the int() reads.
+            fields = line.split(",")[0].split("Duration:")[1].strip().split(":")
+            if len(fields) == 3:
+                try:
+                    dur = int(fields[0]) * 3600 + int(fields[1]) * 60 + float(fields[2])
+                except ValueError:
+                    pass
     return {"duration_s": dur, "has_audio": "Audio:" in text, "has_video": "Video:" in text}
 
 
@@ -147,7 +154,9 @@ def sample_frames(path: str, n: int = 4, duration_s: Optional[float] = None) -> 
     """``n`` frames at evenly spaced times, as PIL RGB images, with the times they came from.
 
     Times sit at the centres of ``n`` equal slices, so a two-frame sample of a ten-second clip
-    reads 2.5 s and 7.5 s rather than the first and last frame, which are often black.
+    reads 2.5 s and 7.5 s rather than the first and last frame, which are often black. A time
+    whose frame ffmpeg cannot produce is skipped, and the times returned are the ones the
+    frames actually came from.
     """
     exe = _need_ffmpeg()
     try:
@@ -161,7 +170,7 @@ def sample_frames(path: str, n: int = 4, duration_s: Optional[float] = None) -> 
         times = [0.0]
     else:
         times = [duration_s * (i + 0.5) / n for i in range(n)]
-    frames = []
+    frames, got = [], []
     for t in times:
         png = _run([exe, "-v", "error", "-ss", "%.3f" % t, "-i", path, "-frames:v", "1",
                     "-f", "image2pipe", "-vcodec", "png", "-"], "read a frame at %.1fs" % t)
@@ -169,9 +178,10 @@ def sample_frames(path: str, n: int = 4, duration_s: Optional[float] = None) -> 
             continue
         with Image.open(io.BytesIO(png)) as im:
             frames.append(im.convert("RGB"))
+        got.append(t)
     if not frames:
         raise RuntimeError("no frame could be read from %r" % path)
-    return frames, times[:len(frames)]
+    return frames, got
 
 
 def contact_sheet(frames: Sequence, cell: int = 512):

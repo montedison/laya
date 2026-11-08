@@ -44,8 +44,21 @@ sets a confidence number. ``route`` is decided per answer, in this order:
    line for that question decides: it was placed where precision holds at
    ``target_precision`` (default 0.95) on your rows, with a 95% Wilson bound to spare.
 2. Otherwise the engine's own machinery decides, no labels required: ``review`` when it
-   abstains at the configured risk, when the answer is ``unbound``, or when the conformal set
-   at ``alpha`` (default 0.10) holds more than one option; ``auto`` only when all three agree.
+   abstains at the configured risk, or when the conformal set at ``alpha`` (default 0.10) holds
+   more than one option; ``auto`` only when both agree. ``unbound`` is still reported on every
+   answer but no longer routes: measured with the published threshold (Embedding Space study,
+   2026-11-08) it fired on 71% of in-domain banking77 rows and 26% of typed-decisions rows,
+   against 93% of off-topic ones, so it sent most good answers to review.
+
+Two more reasons apply to a policy loaded with :meth:`load_calibration` (0.4.29+):
+
+* **outbound**: the policy's routing head measures how much of a record lies outside the space
+  it was trained on; past the limit Studio measured on the calibration rows, every answer of
+  that record goes to ``review``. Policies exported before Studio wrote the limit carry none,
+  and then this check is off.
+* **options changed**: a question asked with an option the policy was never trained on is not
+  calibrated (``calibrated: False`` on that answer) and goes to ``review``; the policy's
+  calibration is not applied to it. It used to raise inside the calibration instead.
 
 Both are targets, not thresholds: ``alpha`` is the miscoverage the sets are allowed, and
 ``target_precision`` is the precision the band is held to. Neither is a confidence a human had
@@ -72,6 +85,7 @@ import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .agent import Agent
+from .hooks import PredictContext, compose_hooks, dispatch, validate_timeout
 
 __all__ = ["VegaAgent", "Router", "is_available", "HEAD_ARRAYS"]
 
@@ -99,9 +113,16 @@ def _to_vega_questions(questions: Mapping[str, Mapping]) -> Dict[str, Dict]:
     The two schemas are the same typed-decision design and differ in one word: laya's yes/no
     is ``noul``, vegaml's is ``boolean``. laya's noul-only ``labels`` (the two sides named)
     becomes vegaml's boolean ``criteria``, which is the same information under the other key.
+
+    Each question goes through :meth:`laya.agent.Agent._check_question` first. The translation
+    reads ``q["type"]`` / ``q["instructions"]`` / ``q["criteria"]`` directly, so a malformed
+    definition used to surface as a bare ``KeyError`` or ``TypeError: string indices must be
+    integers`` that names neither the question nor what to fix, on ``fit`` as well as on
+    ``predict``.
     """
     out = {}
     for qid, q in questions.items():
+        Agent._check_question(qid, q)
         t = q["type"]
         vq: Dict[str, Any] = {"instructions": q["instructions"]}
         if t == "noul":
@@ -137,6 +158,32 @@ def _labels_for(q: Mapping) -> List[str]:
     return [str(k) for k in (crit if isinstance(crit, dict) else crit)]
 
 
+def _engine_number(value: Any, where: str) -> float:
+    """One number off the engine's answer, refused rather than rounded when it is not one.
+
+    ``float()`` reads ``True`` as 1.0 and waves ``nan`` and ``inf`` through, and every comparison
+    against a NaN answers False -- so a NaN ``answer_confidence`` clears ``min_confidence``
+    untouched (``nan < 0.9`` is False) and the answer leaves with ``route: "auto"``, which is the
+    one field this module tells callers to gate on. The same reasoning is already the rule twice
+    over: :func:`laya.train.target_from_gold` raises "probabilities must be finite and
+    non-negative" for a training row, and
+    :func:`laya.integrations._guard.answer_number` refuses a bool and a non-finite for the same
+    gate on the remote-body path. A corrupt distribution is not a decision, and rounding it is
+    how it becomes one.
+    """
+    if isinstance(value, bool):
+        raise ValueError("%s is %r: the engine's numbers must be finite numbers, not a bool"
+                         % (where, value))
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("%s is %r: the engine's numbers must be finite numbers"
+                         % (where, value)) from exc
+    if not math.isfinite(number):
+        raise ValueError("%s is %r: the engine's numbers must be finite numbers" % (where, value))
+    return number
+
+
 def _entropy_confidence(probs: Mapping[str, float]) -> float:
     """``1 - H(p)/log(k)``: what laya reports as ``confidence``. Not an error rate.
 
@@ -156,6 +203,14 @@ def _gold_label(q: Mapping, gold: Any) -> str:
 
     Accepts laya's three shapes for an answer: a bare value, ``{"label": value}`` (the
     typed-decisions dataset), or ``{"probabilities": {...}}`` where the argmax is taken.
+
+    A value that cannot be placed on this question is refused, as
+    :func:`laya.train.target_from_expected` refuses it for the same rows on laya's own fine-tune
+    path. The quiet one is a yes/no written as a float: ``str(1.0)`` is ``"1.0"``, which is not
+    one of the true-words, so the row landed on the **false** side of its own label and the head
+    learned the reverse of what was labelled. A score level outside the question or between two
+    levels, and a choice label the question never offered, are the same class of mistake: the
+    fit takes the string, so nothing downstream can tell it from a real answer.
     """
     if isinstance(gold, dict):
         if "label" in gold:
@@ -166,14 +221,43 @@ def _gold_label(q: Mapping, gold: Any) -> str:
             gold = bool(float(gold["noul"]) >= 0.5)
     t = q["type"]
     if t == "noul":
-        s = str(gold).strip().lower()
-        return "true" if s in ("true", "yes", "1", "t", "y") else "false"
+        if isinstance(gold, bool):
+            return "true" if gold else "false"
+        if isinstance(gold, (int, float)):
+            if gold in (0, 0.0):
+                return "false"
+            if gold in (1, 1.0):
+                return "true"
+        elif isinstance(gold, str):
+            s = gold.strip().lower()
+            if s in ("true", "yes", "1", "t", "y"):
+                return "true"
+            if s in ("false", "no", "0", "f", "n"):
+                return "false"
+        raise ValueError("a noul gold must be true/false, yes/no or 0/1, got %r" % (gold,))
     if t == "score":
+        crit = list(q["criteria"])
+        if isinstance(gold, bool):
+            raise ValueError("a score gold is a level index or a level description, not %r" % (gold,))
         if isinstance(gold, str) and not gold.isdigit():
-            crit = list(q["criteria"])
+            if gold not in crit:
+                raise ValueError("a score gold must be a level index in [0, %d] or one of %r, got %r"
+                                 % (len(crit) - 1, crit, gold))
             return str(crit.index(gold))
-        return str(int(gold))
-    return str(gold)
+        try:
+            level = float(gold)
+        except (TypeError, ValueError, OverflowError):
+            level = None
+        if level is None or not level.is_integer():
+            raise ValueError("a score gold must name one whole level of %r, got %r" % (crit, gold))
+        if not 0 <= level <= len(crit) - 1:
+            raise ValueError("a score gold must be a level index in [0, %d], got %r"
+                             % (len(crit) - 1, gold))
+        return str(int(level))
+    labels = _labels_for(q)
+    if str(gold) in labels:
+        return str(gold)
+    raise ValueError("a choice gold must be one of the question's options %r, got %r" % (labels, gold))
 
 
 def _fold(answer: Mapping, q: Mapping) -> Dict[str, Any]:
@@ -185,7 +269,8 @@ def _fold(answer: Mapping, q: Mapping) -> Dict[str, Any]:
     every yes/no task at 0.000 for a day.
     """
     t = q["type"]
-    probs = {str(k): float(v) for k, v in (answer.get("probs") or {}).items()}
+    probs = {str(k): _engine_number(v, "the probability of %r" % (k,))
+             for k, v in (answer.get("probs") or {}).items()}
     if t == "noul":
         low = {k.lower(): v for k, v in probs.items()}
         probs = {"false": low.get("false", 0.0), "true": low.get("true", 0.0)}
@@ -195,7 +280,7 @@ def _fold(answer: Mapping, q: Mapping) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "type": t,
         "probabilities": {k: round(v, 6) for k, v in probs.items()},
-        "answer_confidence": (round(float(answer["confidence"]), 6)
+        "answer_confidence": (round(_engine_number(answer["confidence"], "the engine's confidence"), 6)
                               if answer.get("confidence") is not None
                               else (round(max(probs.values()), 6) if probs else None)),
         "confidence": _entropy_confidence(probs) if probs else None,
@@ -209,9 +294,11 @@ def _fold(answer: Mapping, q: Mapping) -> Dict[str, Any]:
     elif t == "score":
         best = max(probs, key=probs.get) if probs else None
         level = answer.get("score")
-        out["score"] = int(level) if level is not None else (int(best) if best else None)
+        out["score"] = (int(_engine_number(level, "the engine's score")) if level is not None
+                        else (int(best) if best else None))
         if answer.get("expected_score") is not None:
-            out["expected_score"] = round(float(answer["expected_score"]), 4)
+            out["expected_score"] = round(_engine_number(answer["expected_score"],
+                                                         "the engine's expected score"), 4)
         out["legend"] = {str(i): c for i, c in enumerate(q["criteria"])}
     else:
         ch = answer.get("choice")
@@ -244,7 +331,8 @@ class VegaAgent(Agent):
                  alpha: float = 0.1, risk: Union[str, float] = "0.1",
                  target_precision: float = 0.95, folds: int = 5,
                  mode: str = "auto", revision: Optional[str] = None,
-                 hooks=None, on_predict_start=None, on_predict_end=None, **ignored):
+                 hooks=None, on_predict_start=None, on_predict_end=None,
+                 hooks_raise: bool = True, hooks_timeout: Optional[float] = None, **ignored):
         """Load vega.
 
         ``vegaml`` is the argument that got us here: ``True`` loads the default 0.8B reader,
@@ -259,7 +347,7 @@ class VegaAgent(Agent):
             import vegaml as _vegaml_pkg
         except ImportError as exc:
             raise ImportError(_INSTALL) from exc
-        from .hooks import normalise_hooks
+        from .hooks import normalise_hooks, validate_timeout
 
         which = vegaml if isinstance(vegaml, str) and vegaml else model_id_or_path
         self.vega = _vegaml_pkg.load(which, device=device, backbone=backbone, max_len=max_len,
@@ -271,8 +359,11 @@ class VegaAgent(Agent):
         self.target_precision = float(target_precision)
         self.folds = int(folds)
         self.calibration = None          # a vegaml Calibration, applied on every predict
+        self._novelty = None             # (routing question, limit) from a loaded policy
         self.fit_report: Dict[str, Any] = {}
         self.hooks = normalise_hooks(hooks, on_predict_start, on_predict_end)
+        self.hooks_raise = bool(hooks_raise)
+        self.hooks_timeout = None if hooks_timeout is None else validate_timeout(hooks_timeout)
         self._lock = threading.RLock()
         self.device = getattr(self.vega.engine, "device", device)
         cfg = getattr(self.vega.engine, "cfg", {}) or {}
@@ -298,7 +389,8 @@ class VegaAgent(Agent):
                 head_max_len: Optional[int] = None, min_confidence: Optional[float] = None,
                 asr: Optional[str] = None, language: Optional[str] = None,
                 sampling_rate: Optional[int] = None, hooks=None, on_predict_start=None,
-                on_predict_end=None, **ignored) -> Dict[str, Any]:
+                on_predict_end=None, hooks_raise: Optional[bool] = None,
+                hooks_timeout: Optional[float] = None, **ignored) -> Dict[str, Any]:
         """Answer typed questions about text, an image, a recording or a clip, in laya's shape.
 
         One of ``state``, ``image``, ``audio`` or ``video``. The modality is chosen by which you passed,
@@ -316,6 +408,13 @@ class VegaAgent(Agent):
         has (heads, calibration, set, route); otherwise ``frames`` evenly spaced frames are
         tiled into one image and decided through the image path. ``out["video"]`` says which,
         and why. See :mod:`laya.video`.
+
+        The hook lifecycle is the one :meth:`laya.Agent.predict_batch` runs: ``on_predict_start``
+        fires before the decision (``ctx.skip(...)`` short-circuits it, and a hook may rewrite
+        ``ctx.questions``), ``on_error`` on a failure, ``on_predict_end`` on the finished
+        answer and may rewrite ``ctx.results``. The video path decides recursively through
+        this method, so its hooks fire there too. ``hooks_raise`` and ``hooks_timeout``
+        override the agent's for this call, as on every laya surface.
         """
         if questions is None:
             raise ValueError("predict needs `questions`")
@@ -323,6 +422,54 @@ class VegaAgent(Agent):
         if given != 1:
             raise ValueError("predict takes exactly one of state=, image=, audio=, video=; got %d"
                              % given)
+        active = compose_hooks(self.hooks, hooks, on_predict_start, on_predict_end)
+        raise_errors = self.hooks_raise if hooks_raise is None else bool(hooks_raise)
+        timeout = self.hooks_timeout if hooks_timeout is None else validate_timeout(hooks_timeout)
+        ctx = PredictContext(states=state, questions=questions, model=self.model_id, agent=self,
+                             max_len=max_len, head_max_len=head_max_len)
+        try:
+            dispatch(active, "on_predict_start", ctx, raise_errors=raise_errors,
+                     lock=self._hooks_lock, timeout=timeout)
+            if ctx.results is not None:
+                out = ctx.results
+                if isinstance(out, list) and len(out) == 1:
+                    out = out[0]        # ctx.skip()'s whole-call list, as predict_long takes it
+                if isinstance(out, dict):
+                    ctx.usage = out.get("usage")
+            else:
+                out = self._decide(ctx.states, ctx.questions, lang=lang, image=image,
+                                   audio=audio, video=video, frames=frames, mode=mode,
+                                   views=views, min_confidence=min_confidence, asr=asr,
+                                   language=language, sampling_rate=sampling_rate)
+                ctx.results = out
+                ctx.usage = out.get("usage")
+        except BaseException as exc:
+            ctx.error = exc
+            try:
+                dispatch(active, "on_error", ctx, raise_errors=raise_errors,
+                         lock=self._hooks_lock, timeout=timeout)
+            except BaseException as hook_exc:
+                # A failing on_error hook must not hide the failure that triggered it.
+                exc.__context__ = hook_exc
+            raise
+        finally:
+            ctx.elapsed_ms = (time.perf_counter() - ctx.started_at) * 1000.0
+            try:
+                dispatch(active, "on_predict_end", ctx, raise_errors=raise_errors,
+                         lock=self._hooks_lock, timeout=timeout)
+            except BaseException as hook_exc:
+                # End hooks run on the failure path too; do not let one mask the real error.
+                if ctx.error is not None:
+                    ctx.error.__context__ = hook_exc
+                else:
+                    raise
+        return ctx.results
+
+    def _decide(self, state: Any, questions: Mapping, *, lang: Optional[str], image: Any,
+                audio: Any, video: Any, frames: int, mode: Optional[str], views: int,
+                min_confidence: Optional[float], asr: Optional[str],
+                language: Optional[str], sampling_rate: Optional[int]) -> Dict[str, Any]:
+        """The decision itself, without the hook lifecycle around it."""
         if video is not None:
             return self._predict_video(video, questions, frames=frames, asr=asr, language=language,
                                        mode=mode, views=views, min_confidence=min_confidence,
@@ -333,6 +480,9 @@ class VegaAgent(Agent):
         vq = _to_vega_questions(questions)
         started = time.perf_counter()
         with self._lock:
+            novelty = getattr(self, "_novelty", None)
+            if novelty and novelty[0] in self.vega.heads:
+                self.vega.heads[novelty[0]][0].last_residual = None
             if image is not None:
                 try:
                     raw = self.vega.decide_image(image, vq, mode=mode, alpha=self.alpha, risk=self.risk)
@@ -354,12 +504,28 @@ class VegaAgent(Agent):
             else:
                 raw = self.vega.decide(state, vq, mode=mode, alpha=self.alpha, views=views)
                 modality = "text"
+            stale: Dict[str, List[str]] = {}
             if self.calibration is not None:
-                raw = self.calibration.apply(_pad_for_calibration(raw, self.calibration))
+                stale = _stale_for_calibration(raw, self.calibration)
+                raw = _apply_calibration(raw, self.calibration, stale)
+            outbound = self._read_novelty()
         answers = {}
         for qid, q in questions.items():
             a = _fold(raw["answers"][qid], q)
             a.update(self._route(dict(raw["answers"][qid], _qid=qid), a, min_confidence))
+            if self.calibration is not None:
+                a["calibrated"] = qid in self.calibration.questions and qid not in stale
+            if qid in stale:
+                a["route"] = "review"
+                a["route_reason"] = ("options changed since this policy was trained (%s not in it), "
+                                     "so it is not calibrated; train it again"
+                                     % ", ".join(stale[qid]))
+            if outbound is not None:
+                a["outbound"] = outbound
+                a["route"] = "review"
+                a["route_reason"] = ("outbound: %.3f of this record lies outside the policy's space, "
+                                     "over the limit %.3f; %s" % (outbound["residual"], outbound["limit"],
+                                                                  a["route_reason"]))
             answers[qid] = a
         out = {
             "answers": answers,
@@ -473,6 +639,17 @@ class VegaAgent(Agent):
                        "applied": False, "why": "read whole, within %d tokens" % self.max_len}
         return out
 
+    def _read_novelty(self) -> Optional[Dict[str, Any]]:
+        """The routing head's residual for the record just read, when it passed the limit."""
+        novelty = getattr(self, "_novelty", None)
+        if not novelty or novelty[0] not in self.vega.heads:
+            return None
+        r = getattr(self.vega.heads[novelty[0]][0], "last_residual", None)
+        if r is None or r <= novelty[1]:
+            return None
+        return {"residual": round(float(r), 4), "limit": round(float(novelty[1]), 4),
+                "question": novelty[0]}
+
     # ------------------------------------------------------------------ the route
     def _route(self, raw_answer: Mapping, folded: Mapping, min_confidence: Optional[float]) -> Dict:
         """``route`` and why, decided without a user-set number. See the module docstring."""
@@ -487,8 +664,6 @@ class VegaAgent(Agent):
             reasons = []
             if folded.get("abstain"):
                 reasons.append("the engine abstains at risk %s" % self.risk)
-            if folded.get("unbound"):
-                reasons.append("unbound: far from every well, likely off-distribution")
             pset = folded.get("prediction_set")
             if pset is not None and len(pset) > 1:
                 reasons.append("conformal set at alpha %s holds %d options" % (self.alpha, len(pset)))
@@ -496,8 +671,7 @@ class VegaAgent(Agent):
                 # a head-served answer with no band fitted: nothing here can vouch for it
                 reasons.append("head answer with no fitted band; fit() or calibrate() first")
             route = "review" if reasons else "auto"
-            why = "; ".join(reasons) if reasons else (
-                "conformal singleton, not abstaining, in distribution")
+            why = "; ".join(reasons) if reasons else "conformal singleton, not abstaining"
             if unreachable:
                 # The line was asked to hold target_precision with a 95% lower bound and the
                 # calibration rows could not certify it (12 for 12 certifies nothing). Sending
@@ -516,7 +690,10 @@ class VegaAgent(Agent):
         out: Dict[str, Any] = {"alpha": self.alpha, "risk": self.risk,
                                "target_precision": self.target_precision,
                                "policy": ("band" if self.calibration is not None
-                                          else "conformal set + abstain + unbound")}
+                                          else "conformal set + abstain")}
+        novelty = getattr(self, "_novelty", None)
+        if novelty:
+            out["outbound"] = {"question": novelty[0], "limit": novelty[1]}
         if self.calibration is not None:
             band = self.calibration.band
             out["band"] = ({"default": band.default, "questions": band.questions}
@@ -569,6 +746,10 @@ class VegaAgent(Agent):
         reads, so a corpus prepared for laya's fine-tune fits vega's heads unchanged. A row
         without its own ``questions`` uses ``questions``. A path to a ``.csv`` or ``.jsonl``
         is read with :meth:`load_rows` first.
+
+        A gold keyed to no question id of that row is refused, as ``load_rows`` refuses an
+        unknown CSV column: dropped, it made ``fit`` report success on a corpus whose labels
+        never trained anything. Naming only some of the questions is fine.
         """
         if isinstance(rows, (str, os.PathLike)):
             rows = self.load_rows(rows, questions)
@@ -582,7 +763,11 @@ class VegaAgent(Agent):
             gold = r.get("gold") if r.get("gold") is not None else r.get("expected")
             if not isinstance(gold, Mapping):
                 raise ValueError("each row needs `gold` or `expected` as {question_id: answer}")
-            labels = {qid: _gold_label(qs[qid], g) for qid, g in gold.items() if qid in qs}
+            unknown = [qid for qid in gold if qid not in qs]
+            if unknown:
+                raise ValueError("gold key(s) %s match no question id in %s"
+                                 % (unknown, sorted(qs)))
+            labels = {qid: _gold_label(qs[qid], g) for qid, g in gold.items()}
             if labels:
                 examples.append((r["state"], labels, vq))
         return examples, sheet
@@ -764,29 +949,77 @@ class VegaAgent(Agent):
         np.savez(os.path.join(path, "heads.npz"), **arrays)
         if self.calibration is not None:
             self.calibration.save(os.path.join(path, "calibration.json"))
+        # A manifest of hashes, unsigned: load_calibration checks the folder was not changed.
+        from . import policy
+
+        files = {n: open(os.path.join(path, n), "rb").read()
+                 for n in ("heads.npz", "calibration.json") if os.path.exists(os.path.join(path, n))}
+        try:
+            engine = self.vega.engine.base_sha256()
+        except Exception:
+            engine = None
+        with open(os.path.join(path, "manifest.json"), "wb") as f:
+            f.write(policy.manifest_for(files, format="laya-policy/1", engine_sha256=engine,
+                                        model=self.model_id))
         return {"path": path, "heads": sorted(meta["heads"]),
                 "calibrated": self.calibration is not None}
 
-    def load_calibration(self, path: str) -> Dict[str, Any]:
-        import numpy as np
+    def load_calibration(self, path: str, verify: Union[bool, str] = True) -> Dict[str, Any]:
+        """Install a trained policy from a folder or straight from Studio's downloaded ``.zip``.
+
+        ``verify=True`` (the default) checks before anything is installed: every file has the
+        SHA-256 its manifest states, a signed policy's signature verifies against a key laya
+        trusts, and this agent's engine is the one the policy was trained on. Any failure raises
+        :class:`laya.policy.PolicyError` naming what failed. ``verify="signed"`` also refuses a
+        policy that is not signed. ``verify=False`` skips all of it.
+
+        Returns the questions (laya's spelling, ready for :meth:`predict`) and what was verified.
+        """
         from vegaml.calibrate import Calibration
         from vegaml.ttt import TTTHead
 
-        z = np.load(os.path.join(path, "heads.npz"), allow_pickle=False)
+        from . import policy
+
+        files = policy.read(path)
+        report: Dict[str, Any] = {"status": "skipped"}
+        if verify:
+            report = policy.verify(files, require_signature=(verify == "signed"))
+            try:
+                actual = self.vega.engine.base_sha256()
+            except Exception:  # an engine that cannot hash itself is reported, not guessed
+                actual = None
+            expected = policy.expected_engine(files, report)
+            policy.check_engine(expected, actual)
+            report = dict(report, engine="matches" if (expected and actual) else "not checked")
+            report.pop("manifest", None)
+        z = policy.npz(files)
         meta = json.loads(str(z["meta"]))
-        loaded = []
+        guarded = _guarded_head_class(TTTHead)
+        loaded, limits = [], {}
         for qid, m in meta["heads"].items():
-            head = TTTHead(m["labels"], k=m["k"], l2=m["l2"])
+            head = guarded(m["labels"], k=m["k"], l2=m["l2"])
             for name in HEAD_ARRAYS:
                 setattr(head, name, z["%s::%s" % (qid, name)])
             head.ready = True
             head.engine_accuracy = m.get("engine_accuracy")
             self.vega.heads[qid] = (head, m.get("cv"))
             loaded.append(qid)
-        cal_path = os.path.join(path, "calibration.json")
-        if os.path.exists(cal_path):
-            self.calibration = Calibration.load(cal_path)
-        return {"heads": loaded, "calibrated": self.calibration is not None}
+            if m.get("novelty_max") is not None:
+                limits[qid] = float(m["novelty_max"])
+        if "calibration.json" in files:
+            self.calibration = Calibration.from_payload(json.loads(files["calibration.json"]))
+        out: Dict[str, Any] = {"heads": loaded, "calibrated": self.calibration is not None,
+                               "verified": report}
+        if "questions.json" in files:
+            out["questions"] = json.loads(files["questions.json"])
+            self.policy_questions = out["questions"]
+        # The routing question is the policy's first; Studio measures the limit on its head.
+        order = list(out.get("questions") or {}) or loaded
+        routing = next((q for q in order if q in limits), None)
+        self._novelty = (routing, limits[routing]) if routing else None
+        out["outbound"] = ({"question": routing, "limit": limits[routing]} if routing
+                           else None)
+        return out
 
     # ------------------------------------------------------------------ readers
     @staticmethod
@@ -800,6 +1033,60 @@ class VegaAgent(Agent):
     def fit_binning(self, *a, **kw):
         raise NotImplementedError("histogram binning is laya's own calibration; on vega the "
                                   "calibrated probabilities come from calibrate()")
+
+
+def _residual(head, x) -> float:
+    """The share of a record's standardised signal the head's projection does not hold: what
+    Studio's outbound check measures (studio/heads.py ``residual``)."""
+    import numpy as np
+
+    Z = (np.asarray(x, dtype=np.float32).reshape(1, -1) - head.mu) / head.sd
+    Zc = Z - head.c
+    total = float((Zc ** 2).sum())
+    if total <= 0:
+        return 0.0
+    inside = float(((Zc @ head.P) ** 2).sum())
+    return max(0.0, 1.0 - inside / total)
+
+
+def _guarded_head_class(base):
+    """A head that remembers how far outside its space the last record it read was."""
+    class GuardedHead(base):
+        last_residual = None
+
+        def predict(self, x, allowed=None):
+            self.last_residual = _residual(self, x)
+            return super().predict(x, allowed)
+
+    return GuardedHead
+
+
+def _stale_for_calibration(result: Mapping, cal) -> Dict[str, List[str]]:
+    """Questions whose answer names an option the calibration was never fitted on, with those
+    options. Applying the calibration to them raised "probability key names no option"."""
+    out: Dict[str, List[str]] = {}
+    for qid, ans in (result.get("answers") or {}).items():
+        fitted = cal.questions.get(qid)
+        if fitted is None or not ans.get("probs"):
+            continue
+        known = {str(o).lower() for o in fitted["labels"]}
+        new = [str(k) for k in ans["probs"] if str(k).lower() not in known]
+        if new:
+            out[qid] = new
+    return out
+
+
+def _apply_calibration(result: Mapping, cal, stale: Mapping) -> Dict:
+    """The calibration on every answer it covers; stale answers pass through untouched."""
+    if not stale:
+        return cal.apply(_pad_for_calibration(result, cal))
+    answers = result["answers"]
+    sub = dict(result)
+    sub["answers"] = {q: a for q, a in answers.items() if q not in stale}
+    done = cal.apply(_pad_for_calibration(sub, cal))
+    merged = dict(done)
+    merged["answers"] = {q: (answers[q] if q in stale else done["answers"][q]) for q in answers}
+    return merged
 
 
 def _pad_for_calibration(result: Mapping, cal) -> Dict:

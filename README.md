@@ -244,26 +244,20 @@ The shipped checkpoints work zero-shot, but fine-tuning on decisions from your o
 
 **[nandhakishorm.github.io/laya](https://nandhakishorm.github.io/laya/)**: guides for [prediction hooks](https://nandhakishorm.github.io/laya/hooks/), [schema-driven decisions](https://nandhakishorm.github.io/laya/structured/), [Docker](https://nandhakishorm.github.io/laya/docker/) and [LangChain and LangGraph](https://nandhakishorm.github.io/laya/langchain/), plus a full [API reference](https://nandhakishorm.github.io/laya/reference/).
 
-## What's new in 0.4.27
+## What's new in 0.4.30
 
-* **Faster CPU inference on long inputs.** On transformers 5, ModernBERT's local attention
-  layers compute their window in blocks instead of full-sequence attention masked afterwards,
-  and the decision head packs its projections and, in its final layer, scores only the marker
-  and pooled positions. Same weights, same answers: a 186-key real-weights comparison across
-  the three checkpoints, short and long states, batches and `predict_long` matched 0.4.26 to
-  six decimals. Measured 26 to 55 percent lower latency between 2k and 7k tokens (#1467).
-* **Named refusals instead of leaked errors.** `predict_batch` and `predict_long` refuse a
-  float, string or boolean `batch_size` with a `ValueError` before any state is encoded, and
-  `None`, `0` and negatives still mean no cap (#1458); a wide integer in an adapter answer is
-  refused as malformed rather than raising `OverflowError` (#1466); the Router's fallback for
-  older agents composes both legacy keywords (#1468); the ONNX exporter's default opset
-  follows the installed torch (#1451).
-* **`laya-ts` Router parity.** `leafNonEnglish` reads each line on its own, as Python does
-  (#1450, fixes #1449); `maxLoaded` is read as `int()` reads it, so an unreadable cap cannot
-  disable eviction (#1457); `hooksTimeout` bounds the Router's own hooks (#1459);
-  `predictBatch` gates on `minConfidence` (#1460) and groups by the resolved checkpoint (#1461).
-* **TypeScript HTTP SDK: `predictBatch`** sends independent states with one question set to
-  `/v1/systemone/batch` in one request (#1471).
+* **`Agent(vegaml=True)` refuses bad input by name instead of training on it.** A yes/no gold
+  of `1.0` used to train as `false`; fit golds are now read the way laya's fine-tune reads them
+  (#1474), a gold keyed to no question is refused (#1477), and a malformed question is refused
+  through laya's own question check (#1476). A non-finite number from the engine is refused
+  before it can become a confident `auto` decision (#1475).
+* **Hooks run on vega.** `on_predict_start`, `on_predict_end` and `on_error`, plus
+  `hooks_raise` and `hooks_timeout`, now work on `VegaAgent.predict` as on every laya surface
+  (#1480).
+* **Video and policies.** Frame times report the frame each one came from (#1481), a clip with
+  no duration no longer crashes the banner fallback (#1478), and a malformed policy manifest is
+  a `PolicyError` (#1487). Loading a trained policy and how routing works are in
+  [docs/vegaml.md](https://github.com/NandhaKishorM/laya/blob/main/docs/vegaml.md).
 
 ## Where to go next
 
