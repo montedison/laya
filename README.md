@@ -5,6 +5,25 @@
   </picture>
 </p>
 
+> **Cite this work.** M, N.; M, A. From Laya to Vega: Open Non-Autoregressive Decision Models with Calibrated Probabilities. *Preprints* **2026**, 2026110781. [https://doi.org/10.20944/preprints202611.0781.v1](https://doi.org/10.20944/preprints202611.0781.v1)
+
+<details>
+<summary>BibTeX</summary>
+
+```bibtex
+@article{m2026laya_vega,
+  title   = {From Laya to Vega: Open Non-Autoregressive Decision Models with Calibrated Probabilities},
+  author  = {M, N. and M, A.},
+  journal = {Preprints},
+  year    = {2026},
+  pages   = {2026110781},
+  doi     = {10.20944/preprints202611.0781.v1},
+  url     = {https://doi.org/10.20944/preprints202611.0781.v1}
+}
+```
+
+</details>
+
 **Multilingual, non-autoregressive System 1 decision engine.** Typed decisions over 100+ languages in a single forward pass — 33 ms — trained with reinforcement learning against strictly proper scoring rules (RLCD), with a router that picks the right checkpoint per request.
 
 <div align="center">
@@ -244,20 +263,18 @@ The shipped checkpoints work zero-shot, but fine-tuning on decisions from your o
 
 **[nandhakishorm.github.io/laya](https://nandhakishorm.github.io/laya/)**: guides for [prediction hooks](https://nandhakishorm.github.io/laya/hooks/), [schema-driven decisions](https://nandhakishorm.github.io/laya/structured/), [Docker](https://nandhakishorm.github.io/laya/docker/) and [LangChain and LangGraph](https://nandhakishorm.github.io/laya/langchain/), plus a full [API reference](https://nandhakishorm.github.io/laya/reference/).
 
-## What's new in 0.4.30
+## What's new in 0.4.31
 
-* **`Agent(vegaml=True)` refuses bad input by name instead of training on it.** A yes/no gold
-  of `1.0` used to train as `false`; fit golds are now read the way laya's fine-tune reads them
-  (#1474), a gold keyed to no question is refused (#1477), and a malformed question is refused
-  through laya's own question check (#1476). A non-finite number from the engine is refused
-  before it can become a confident `auto` decision (#1475).
-* **Hooks run on vega.** `on_predict_start`, `on_predict_end` and `on_error`, plus
-  `hooks_raise` and `hooks_timeout`, now work on `VegaAgent.predict` as on every laya surface
-  (#1480).
-* **Video and policies.** Frame times report the frame each one came from (#1481), a clip with
-  no duration no longer crashes the banner fallback (#1478), and a malformed policy manifest is
-  a `PolicyError` (#1487). Loading a trained policy and how routing works are in
-  [docs/vegaml.md](https://github.com/NandhaKishorM/laya/blob/main/docs/vegaml.md).
+* **LangChain and LangGraph can follow vega's own route.** `LayaRouter(decision_policy="native")`
+  returns the fallback branch whenever the answer says `route: "review"`, even at high
+  confidence, and a business branch only on `auto`. The default stays `"confidence"` (#1489).
+* **Cached answers through hooks work on vega.** A start hook's `ctx.skip([result])` returns the
+  answer itself from `predict`, and `predict_long` no longer raises on a cached answer or alters
+  it (#1488). Loading a heads-only policy clears a previous calibration instead of keeping it
+  and reporting `calibrated: True` (#1479).
+* **`laya-ts` explains its routing.** An opt-in diagnostic says which field and line decided the
+  language, matching Python's `analyse(..., explain=True)`. Off by default, and decisions are
+  unchanged (#1447).
 
 ## Where to go next
 
